@@ -13,31 +13,9 @@
 #include "Features/API/Internal.hpp"
 
 using FNScriptData = CScript * (*)(int);
+FNScriptData scriptList = nullptr;
+TRoutine assetGetIndexFunc;
 
-YYTKStatus MmGetScriptData(CScript*& outScript, int index)
-{
-#ifdef _WIN64
-
-	uintptr_t FuncCallPattern = FindPattern("\xE8\x00\x00\x00\x00\x33\xC9\x0F\xB7\xD3", "x????xxxxx", 0, 0);
-
-	if (!FuncCallPattern)
-		return YYTK_INVALIDRESULT;
-
-	uintptr_t Relative = *reinterpret_cast<uint32_t*>(FuncCallPattern + 1);
-	Relative = (FuncCallPattern + 5) + Relative;
-
-	if (!Relative)
-		return YYTK_INVALIDRESULT;
-
-	outScript = reinterpret_cast<FNScriptData>(Relative)(index);
-
-	return YYTK_OK;
-#else
-	return YYTK_UNAVAILABLE;
-#endif
-}
-
-/*
 YYTKStatus MmGetScriptData(FNScriptData& outScript)
 {
 #ifdef _WIN64
@@ -60,7 +38,57 @@ YYTKStatus MmGetScriptData(FNScriptData& outScript)
 	return YYTK_UNAVAILABLE;
 #endif
 }
-*/
+
+void Hook(void* NewFunc, void* TargetFuncPointer, void** pfnOriginal, const char* Name)
+{
+	if (TargetFuncPointer)
+	{
+		auto Status = MH_CreateHook(TargetFuncPointer, NewFunc, pfnOriginal);
+		if (Status != MH_OK)
+			PrintMessage(
+				CLR_RED,
+				"Failed to hook function %s (MH Status %s) in %s at line %d",
+				Name,
+				MH_StatusToString(Status),
+				__FILE__,
+				__LINE__
+			);
+		else
+			MH_EnableHook(TargetFuncPointer);
+
+		PrintMessage(CLR_GRAY, "- &%s = 0x%p", Name, TargetFuncPointer);
+	}
+	else
+	{
+		PrintMessage(
+			CLR_RED,
+			"Failed to hook function %s (address not found) in %s at line %d",
+			Name,
+			__FILE__,
+			__LINE__
+		);
+	}
+};
+
+void HookScriptFunction(const char* scriptFunctionName, void* detourFunction, void** origScript)
+{
+	RValue Result;
+	RValue arg{};
+	arg.Kind = VALUE_STRING;
+	arg.String = RefString::Alloc(scriptFunctionName, strlen(scriptFunctionName));
+	assetGetIndexFunc(&Result, nullptr, nullptr, 1, &arg);
+
+	int scriptFunctionIndex = static_cast<int>(Result.Real) - 100000;
+
+	CScript* CScript = scriptList(scriptFunctionIndex);
+
+	Hook(
+		detourFunction,
+		(void*)(CScript->s_pFunc->pScriptFunc),
+		origScript,
+		scriptFunctionName
+	);
+}
 
 # define M_PI           3.14159265358979323846
 // CallBuiltIn is way too slow to use per frame. Need to investigate if there's a better way to call in built functions.
@@ -231,35 +259,19 @@ static int curFuncParamDepth = 0;
 
 typedef YYRValue* (*ScriptFunc)(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args);
 
-ScriptFunc origSpawnMobScript = nullptr;
 
-YYRValue* spawnMobFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
+YYRValue* RunStructFunctions(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args, auto& setFuncParams, int numParams, int structIndex, int returnArgIndex)
 {
-//	PrintMessage(CLR_DEFAULT, "Detoured mob script");
-	return origSpawnMobScript(Self, Other, ReturnValue, numArgs, Args);
-};
+	int StructHash = baseMobVarIndexMap[structIndex];
+	RValue* StructRef = nullptr;
+	Self->m_yyvarsMap->FindElement(StructHash, StructRef);
+	YYObjectBase* Struct = StructRef->Object;
 
-ScriptFunc origOnTakeDamageScript = nullptr;
-static long long onTakeDamageFuncTime = 0;
-static int onTakeDamageNumTimes = 0;
-
-YYRValue* OnTakeDamageFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
-{
-	auto start = std::chrono::high_resolution_clock::now();
-
-	int OnTakeDamageStructHash = baseMobVarIndexMap[3];
-	RValue* OnTakeDamageStructRef = nullptr;
-	Self->m_yyvarsMap->FindElement(OnTakeDamageStructHash, OnTakeDamageStructRef);
-	YYObjectBase* OnTakeDamageStruct = OnTakeDamageStructRef->Object;
-
-	if (!(OnTakeDamageStruct->m_yyvarsMap) || OnTakeDamageStruct->m_yyvarsMap->m_numUsed == 0)
+	if (!(Struct->m_yyvarsMap) || Struct->m_yyvarsMap->m_numUsed == 0)
 	{
-		ReturnValue->Kind = Args[0]->Kind;
-		ReturnValue->Real = Args[0]->Real;
-		auto end = std::chrono::high_resolution_clock::now();
-		onTakeDamageFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-		onTakeDamageNumTimes++;
-		return Args[0];
+		ReturnValue->Kind = Args[returnArgIndex]->Kind;
+		ReturnValue->Real = Args[returnArgIndex]->Real;
+		return Args[returnArgIndex];
 	}
 
 	int baseMobArrHash = baseMobVarIndexMap[1000];
@@ -271,44 +283,65 @@ YYRValue* OnTakeDamageFuncDetour(CInstance* Self, CInstance* Other, YYRValue* Re
 	baseMobArrRef->RefArray->length = 10;
 	curFuncParamDepth++;
 
-	int invincibleHash = baseMobVarIndexMap[6];
-	RValue* invincibleRef = nullptr;
-	Self->m_yyvarsMap->FindElement(invincibleHash, invincibleRef);
-
 	scriptExecuteArgsArray[1].Kind = VALUE_ARRAY;
 	scriptExecuteArgsArray[1].RefArray = baseMobArrRef->RefArray;
 	scriptExecuteArgsArray[2].Kind = VALUE_REAL;
 	scriptExecuteArgsArray[2].Real = 0;
 	scriptExecuteArgsArray[3].Kind = VALUE_REAL;
-	scriptExecuteArgsArray[3].Real = 6;
+	scriptExecuteArgsArray[3].Real = numParams;
 
-	for (int i = 0; i < OnTakeDamageStruct->m_yyvarsMap->m_curSize; i++)
+	for (int i = 0; i < Struct->m_yyvarsMap->m_curSize; i++)
 	{
-		if (OnTakeDamageStruct->m_yyvarsMap->m_pBuckets[i].Hash != 0)
+		if (Struct->m_yyvarsMap->m_pBuckets[i].Hash != 0)
 		{
-			RValue* curValue = OnTakeDamageStruct->m_yyvarsMap->m_pBuckets[i].v;
+			RValue* curValue = Struct->m_yyvarsMap->m_pBuckets[i].v;
 			RValue returnValue;
 
 			scriptExecuteArgsArray[0] = *curValue;
 
-			paramArr[0] = *(Args[0]);
-			paramArr[1] = *(Args[1]);
-			paramArr[2] = *(Args[2]);
-			paramArr[3].Kind = VALUE_OBJECT;
-			paramArr[3].Instance = Self;
-			paramArr[4] = *invincibleRef;
-			paramArr[5] = *(Args[3]);
+			setFuncParams(paramArr, Args, Self);
 
 			scriptExecuteFunc(&returnValue, Self, Other, 4, scriptExecuteArgsArray);
-			Args[0]->Real = returnValue.Real;
+			Args[returnArgIndex]->Real = returnValue.Real;
 		}
 	}
 	baseMobArrRef->RefArray->m_Array = prevRefArr;
 	baseMobArrRef->RefArray->length = prevRefArrLength;
 	curFuncParamDepth--;
 
-	ReturnValue->Kind = Args[0]->Kind;
-	ReturnValue->Real = Args[0]->Real;
+	ReturnValue->Kind = Args[returnArgIndex]->Kind;
+	ReturnValue->Real = Args[returnArgIndex]->Real;
+	return Args[returnArgIndex];
+}
+
+ScriptFunc origOnTakeDamageScript = nullptr;
+static long long onTakeDamageFuncTime = 0;
+static int onTakeDamageNumTimes = 0;
+
+YYRValue* OnTakeDamageFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
+{
+	auto start = std::chrono::high_resolution_clock::now();
+
+	int invincibleHash = baseMobVarIndexMap[6];
+	RValue* invincibleRef = nullptr;
+	Self->m_yyvarsMap->FindElement(invincibleHash, invincibleRef);
+
+	auto setFuncParams = [invincibleRef](RValue* paramArr, YYRValue** Args, CInstance* Self) {
+		paramArr[0] = *(Args[0]);
+		paramArr[1] = *(Args[1]);
+		paramArr[2] = *(Args[2]);
+		paramArr[3].Kind = VALUE_OBJECT;
+		paramArr[3].Instance = Self;
+		paramArr[4] = *invincibleRef;
+		paramArr[5] = *(Args[3]);
+	};
+
+	int numParams = 6;
+	int structIndex = 3;
+	int returnArgIndex = 0;
+
+	RunStructFunctions(Self, Other, ReturnValue, numArgs, Args, setFuncParams, numParams, structIndex, returnArgIndex);
+
 	auto end = std::chrono::high_resolution_clock::now();
 	onTakeDamageFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 	onTakeDamageNumTimes++;
@@ -374,68 +407,26 @@ YYRValue* OnTakeDamageAfterFuncDetour(CInstance* Self, CInstance* Other, YYRValu
 {
 	auto start = std::chrono::high_resolution_clock::now();
 
-	int OnTakeDamageAfterStructHash = baseMobVarIndexMap[4];
-	RValue* OnTakeDamageAfterStructRef = nullptr;
-	Self->m_yyvarsMap->FindElement(OnTakeDamageAfterStructHash, OnTakeDamageAfterStructRef);
-	YYObjectBase* OnTakeDamageAfterStruct = OnTakeDamageAfterStructRef->Object;
-
-	if (!(OnTakeDamageAfterStruct->m_yyvarsMap) || OnTakeDamageAfterStruct->m_yyvarsMap->m_numUsed == 0)
-	{
-		ReturnValue->Kind = Args[0]->Kind;
-		ReturnValue->Real = Args[0]->Real;
-		auto end = std::chrono::high_resolution_clock::now();
-		onTakeDamageAfterFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-		onTakeDamageAfterNumTimes++;
-		return Args[0];
-	}
-
-	int baseMobArrHash = baseMobVarIndexMap[1000];
-	RValue* baseMobArrRef = nullptr;
-	Self->m_yyvarsMap->FindElement(baseMobArrHash, baseMobArrRef);
-	RValue* prevRefArr = baseMobArrRef->RefArray->m_Array;
-	int prevRefArrLength = baseMobArrRef->RefArray->length;
-	RValue* paramArr = baseMobArrRef->RefArray->m_Array = curFuncParamArr[curFuncParamDepth];
-	baseMobArrRef->RefArray->length = 10;
-	curFuncParamDepth++;
-
 	int invincibleHash = baseMobVarIndexMap[6];
 	RValue* invincibleRef = nullptr;
 	Self->m_yyvarsMap->FindElement(invincibleHash, invincibleRef);
 
-	scriptExecuteArgsArray[1].Kind = VALUE_ARRAY;
-	scriptExecuteArgsArray[1].RefArray = baseMobArrRef->RefArray;
-	scriptExecuteArgsArray[2].Kind = VALUE_REAL;
-	scriptExecuteArgsArray[2].Real = 0;
-	scriptExecuteArgsArray[3].Kind = VALUE_REAL;
-	scriptExecuteArgsArray[3].Real = 6;
+	auto setFuncParams = [invincibleRef](RValue* paramArr, YYRValue** Args, CInstance* Self) {
+		paramArr[0] = *(Args[0]);
+		paramArr[1] = *(Args[1]);
+		paramArr[2] = *(Args[2]);
+		paramArr[3].Kind = VALUE_OBJECT;
+		paramArr[3].Instance = Self;
+		paramArr[4] = *invincibleRef;
+		paramArr[5] = *(Args[3]);
+	};
 
-	for (int i = 0; i < OnTakeDamageAfterStruct->m_yyvarsMap->m_curSize; i++)
-	{
-		if (OnTakeDamageAfterStruct->m_yyvarsMap->m_pBuckets[i].Hash != 0)
-		{
-			RValue* curValue = OnTakeDamageAfterStruct->m_yyvarsMap->m_pBuckets[i].v;
-			RValue returnValue;
+	int numParams = 6;
+	int structIndex = 4;
+	int returnArgIndex = 0;
 
-			scriptExecuteArgsArray[0] = *curValue;
-
-			paramArr[0] = *(Args[0]);
-			paramArr[1] = *(Args[1]);
-			paramArr[2] = *(Args[2]);
-			paramArr[3].Kind = VALUE_OBJECT;
-			paramArr[3].Instance = Self;
-			paramArr[4] = *invincibleRef;
-			paramArr[5] = *(Args[3]);
-
-			scriptExecuteFunc(&returnValue, Self, Other, 4, scriptExecuteArgsArray);
-			Args[0]->Real = returnValue.Real;
-		}
-	}
-	baseMobArrRef->RefArray->m_Array = prevRefArr;
-	baseMobArrRef->RefArray->length = prevRefArrLength;
-	curFuncParamDepth--;
-
-	ReturnValue->Kind = Args[0]->Kind;
-	ReturnValue->Real = Args[0]->Real;
+	RunStructFunctions(Self, Other, ReturnValue, numArgs, Args, setFuncParams, numParams, structIndex, returnArgIndex);
+	
 	auto end = std::chrono::high_resolution_clock::now();
 	onTakeDamageAfterFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 	onTakeDamageAfterNumTimes++;
@@ -450,62 +441,20 @@ YYRValue* OnDodgeFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnV
 {
 	auto start = std::chrono::high_resolution_clock::now();
 
-	int OnDodgeStructHash = baseMobVarIndexMap[5];
-	RValue* OnDodgeStructRef = nullptr;
-	Self->m_yyvarsMap->FindElement(OnDodgeStructHash, OnDodgeStructRef);
-	YYObjectBase* OnDodgeStruct = OnDodgeStructRef->Object;
+	auto setFuncParams = [](RValue* paramArr, YYRValue** Args, CInstance* Self) {
+		paramArr[0] = *(Args[0]);
+		paramArr[1] = *(Args[1]);
+		paramArr[2] = *(Args[2]);
+		paramArr[3].Kind = VALUE_OBJECT;
+		paramArr[3].Instance = Self;
+	};
 
-	if (!(OnDodgeStruct->m_yyvarsMap) || OnDodgeStruct->m_yyvarsMap->m_numUsed == 0)
-	{
-		ReturnValue->Kind = Args[0]->Kind;
-		ReturnValue->Real = Args[0]->Real;
-		auto end = std::chrono::high_resolution_clock::now();
-		onDodgeFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-		onDodgeNumTimes++;
-		return Args[0];
-	}
+	int numParams = 4;
+	int structIndex = 5;
+	int returnArgIndex = 0;
 
-	int baseMobArrHash = baseMobVarIndexMap[1000];
-	RValue* baseMobArrRef = nullptr;
-	Self->m_yyvarsMap->FindElement(baseMobArrHash, baseMobArrRef);
-	RValue* prevRefArr = baseMobArrRef->RefArray->m_Array;
-	int prevRefArrLength = baseMobArrRef->RefArray->length;
-	RValue* paramArr = baseMobArrRef->RefArray->m_Array = curFuncParamArr[curFuncParamDepth];
-	baseMobArrRef->RefArray->length = 10;
-	curFuncParamDepth++;
+	RunStructFunctions(Self, Other, ReturnValue, numArgs, Args, setFuncParams, numParams, structIndex, returnArgIndex);
 
-	scriptExecuteArgsArray[1].Kind = VALUE_ARRAY;
-	scriptExecuteArgsArray[1].RefArray = baseMobArrRef->RefArray;
-	scriptExecuteArgsArray[2].Kind = VALUE_REAL;
-	scriptExecuteArgsArray[2].Real = 0;
-	scriptExecuteArgsArray[3].Kind = VALUE_REAL;
-	scriptExecuteArgsArray[3].Real = 4;
-
-	for (int i = 0; i < OnDodgeStruct->m_yyvarsMap->m_curSize; i++)
-	{
-		if (OnDodgeStruct->m_yyvarsMap->m_pBuckets[i].Hash != 0)
-		{
-			RValue* curValue = OnDodgeStruct->m_yyvarsMap->m_pBuckets[i].v;
-			RValue returnValue;
-
-			scriptExecuteArgsArray[0] = *curValue;
-
-			paramArr[0] = *(Args[0]);
-			paramArr[1] = *(Args[1]);
-			paramArr[2] = *(Args[2]);
-			paramArr[3].Kind = VALUE_OBJECT;
-			paramArr[3].Instance = Self;
-
-			scriptExecuteFunc(&returnValue, Self, Other, 4, scriptExecuteArgsArray);
-			Args[0]->Real = returnValue.Real;
-		}
-	}
-	baseMobArrRef->RefArray->m_Array = prevRefArr;
-	baseMobArrRef->RefArray->length = prevRefArrLength;
-	curFuncParamDepth--;
-
-	ReturnValue->Kind = Args[0]->Kind;
-	ReturnValue->Real = Args[0]->Real;
 	auto end = std::chrono::high_resolution_clock::now();
 	onDodgeFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 	onDodgeNumTimes++;
@@ -527,7 +476,6 @@ YYRValue* ApplyDamageFuncDetour(CInstance* Self, CInstance* Other, YYRValue* Ret
 	applyDamageNumTimes++;
 	isInTakeDamageFunc = prevIsInTakeDamageFunc;
 	return res;
-//	return &tempRet;
 };
 
 ScriptFunc origHitNumberScript = nullptr;
@@ -670,10 +618,7 @@ YYRValue* HitTargetFuncDetour(CInstance* Self, CInstance* Other, YYRValue* Retur
 {
 	YYRValue Res;
 	hitTargetIndex = Args[0]->Object->m_slot;
-//	CallBuiltin(Res, "variable_instance_get", Self, Other, { (long long)Self->i_id, "enemiesInvincMap" });
 	YYRValue ResOne;
-//	CallBuiltin(ResOne, "struct_names_count", Self, Other, { Res });
-//	PrintMessage(CLR_DEFAULT, "count before: %f", ResOne.Real);
 	isInHitTarget = true;
 	auto start = std::chrono::high_resolution_clock::now();
 	YYRValue* res = nullptr;
@@ -681,8 +626,6 @@ YYRValue* HitTargetFuncDetour(CInstance* Self, CInstance* Other, YYRValue* Retur
 	{
 		res = origHitTargetScript(Self, Other, ReturnValue, numArgs, Args);
 	}
-//	CallBuiltin(ResOne, "struct_names_count", Self, Other, { Res });
-//	PrintMessage(CLR_DEFAULT, "count after: %f", ResOne.Real);
 	auto end = std::chrono::high_resolution_clock::now();
 	hitTargetFuncTime += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 	hitTargetNumTimes++;
@@ -735,62 +678,20 @@ YYRValue* OnCriticalHitFuncDetour(CInstance* Self, CInstance* Other, YYRValue* R
 {
 	auto start = std::chrono::high_resolution_clock::now();
 
-	int onCriticalHitStructHash = baseMobVarIndexMap[2];
-	RValue* onCriticalHitStructRef = nullptr;
-	Self->m_yyvarsMap->FindElement(onCriticalHitStructHash, onCriticalHitStructRef);
-	YYObjectBase* onCriticalStruct = onCriticalHitStructRef->Object;
+	auto setFuncParams = [](RValue* paramArr, YYRValue** Args, CInstance* Self) {
+		paramArr[0].Kind = VALUE_OBJECT;
+		paramArr[0].Instance = Self;
+		paramArr[1] = *(Args[0]);
+		paramArr[2] = *(Args[1]);
+		paramArr[3] = *(Args[2]);
+	};
 
-	if (!(onCriticalStruct->m_yyvarsMap) || onCriticalStruct->m_yyvarsMap->m_numUsed == 0)
-	{
-		ReturnValue->Kind = Args[2]->Kind;
-		ReturnValue->Real = Args[2]->Real;
-		auto end = std::chrono::high_resolution_clock::now();
-		onCriticalHitFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-		onCriticalHitNumTimes++;
-		return Args[2];
-	}
+	int numParams = 4;
+	int structIndex = 2;
+	int returnArgIndex = 2;
 
-	int baseMobArrHash = baseMobVarIndexMap[1000];
-	RValue* baseMobArrRef = nullptr;
-	Self->m_yyvarsMap->FindElement(baseMobArrHash, baseMobArrRef);
-	RValue* prevRefArr = baseMobArrRef->RefArray->m_Array;
-	int prevRefArrLength = baseMobArrRef->RefArray->length;
-	RValue* paramArr = baseMobArrRef->RefArray->m_Array = curFuncParamArr[curFuncParamDepth];
-	baseMobArrRef->RefArray->length = 10;
-	curFuncParamDepth++;
+	RunStructFunctions(Self, Other, ReturnValue, numArgs, Args, setFuncParams, numParams, structIndex, returnArgIndex);
 
-	scriptExecuteArgsArray[1].Kind = VALUE_ARRAY;
-	scriptExecuteArgsArray[1].RefArray = baseMobArrRef->RefArray;
-	scriptExecuteArgsArray[2].Kind = VALUE_REAL;
-	scriptExecuteArgsArray[2].Real = 0;
-	scriptExecuteArgsArray[3].Kind = VALUE_REAL;
-	scriptExecuteArgsArray[3].Real = 4;
-	
-	for (int i = 0; i < onCriticalStruct->m_yyvarsMap->m_curSize; i++)
-	{
-		if (onCriticalStruct->m_yyvarsMap->m_pBuckets[i].Hash != 0)
-		{
-			RValue* curValue = onCriticalStruct->m_yyvarsMap->m_pBuckets[i].v;
-			RValue returnValue;
-
-			scriptExecuteArgsArray[0] = *curValue;
-
-			paramArr[0].Kind = VALUE_OBJECT;
-			paramArr[0].Instance = Self;
-			paramArr[1] = *(Args[0]);
-			paramArr[2] = *(Args[1]);
-			paramArr[3] = *(Args[2]);
-			
-			scriptExecuteFunc(&returnValue, Self, Other, 4, scriptExecuteArgsArray );
-			Args[2]->Real = returnValue.Real;
-		}
-	}
-	baseMobArrRef->RefArray->m_Array = prevRefArr;
-	baseMobArrRef->RefArray->length = prevRefArrLength;
-	curFuncParamDepth--;
-
-	ReturnValue->Kind = Args[2]->Kind;
-	ReturnValue->Real = Args[2]->Real;
 	auto end = std::chrono::high_resolution_clock::now();
 	onCriticalHitFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 	onCriticalHitNumTimes++;
@@ -806,61 +707,21 @@ static int afterCriticalHitSlowNumTimes = 0;
 YYRValue* AfterCriticalHitFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
 	auto start = std::chrono::high_resolution_clock::now();
-	int afterCriticalHitStructHash = baseMobVarIndexMap[1];
-	RValue* afterCriticalHitStructRef = nullptr;
-	Self->m_yyvarsMap->FindElement(afterCriticalHitStructHash, afterCriticalHitStructRef);
-	YYObjectBase* afterCriticalHitStruct = afterCriticalHitStructRef->Object;
-	if (!(afterCriticalHitStruct->m_yyvarsMap) || afterCriticalHitStruct->m_yyvarsMap->m_numUsed == 0)
-	{
-		ReturnValue->Kind = Args[2]->Kind;
-		ReturnValue->Object = Args[2]->Object;
-		auto end = std::chrono::high_resolution_clock::now();
-		afterCriticalHitQuickFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-		afterCriticalHitQuickNumTimes++;
-		return Args[2];
-	}
 
-	int baseMobArrHash = baseMobVarIndexMap[1000];
-	RValue* baseMobArrRef = nullptr;
-	Self->m_yyvarsMap->FindElement(baseMobArrHash, baseMobArrRef);
-	RValue* prevRefArr = baseMobArrRef->RefArray->m_Array;
-	int prevRefArrLength = baseMobArrRef->RefArray->length;
-	RValue* paramArr = baseMobArrRef->RefArray->m_Array = curFuncParamArr[curFuncParamDepth];
-	baseMobArrRef->RefArray->length = 10;
-	curFuncParamDepth++;
+	auto setFuncParams = [](RValue* paramArr, YYRValue** Args, CInstance* Self) {
+		paramArr[0].Kind = VALUE_OBJECT;
+		paramArr[0].Instance = Self;
+		paramArr[1] = *(Args[0]);
+		paramArr[2] = *(Args[1]);
+		paramArr[3] = *(Args[2]);
+	};
 
-	scriptExecuteArgsArray[1].Kind = VALUE_ARRAY;
-	scriptExecuteArgsArray[1].RefArray = baseMobArrRef->RefArray;
-	scriptExecuteArgsArray[2].Kind = VALUE_REAL;
-	scriptExecuteArgsArray[2].Real = 0;
-	scriptExecuteArgsArray[3].Kind = VALUE_REAL;
-	scriptExecuteArgsArray[3].Real = 4;
+	int numParams = 4;
+	int structIndex = 1;
+	int returnArgIndex = 2;
 
-	for (int i = 0; i < afterCriticalHitStruct->m_yyvarsMap->m_curSize; i++)
-	{
-		if (afterCriticalHitStruct->m_yyvarsMap->m_pBuckets[i].Hash != 0)
-		{
-			RValue* curValue = afterCriticalHitStruct->m_yyvarsMap->m_pBuckets[i].v;
-			RValue returnValue;
+	RunStructFunctions(Self, Other, ReturnValue, numArgs, Args, setFuncParams, numParams, structIndex, returnArgIndex);
 
-			scriptExecuteArgsArray[0] = *curValue;
-
-			paramArr[0].Kind = VALUE_OBJECT;
-			paramArr[0].Instance = Self;
-			paramArr[1] = *(Args[0]);
-			paramArr[2] = *(Args[1]);
-			paramArr[3] = *(Args[2]);
-
-			scriptExecuteFunc(&returnValue, Self, Other, 4, scriptExecuteArgsArray);
-			Args[2]->Real = returnValue.Real;
-		}
-	}
-	baseMobArrRef->RefArray->m_Array = prevRefArr;
-	baseMobArrRef->RefArray->length = prevRefArrLength;
-	curFuncParamDepth--;
-
-	ReturnValue->Kind = Args[2]->Kind;
-	ReturnValue->Real = Args[2]->Real;
 	auto end = std::chrono::high_resolution_clock::now();
 	afterCriticalHitSlowFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 	afterCriticalHitSlowNumTimes++;
@@ -877,59 +738,18 @@ YYRValue* BeforeDamageCalculationFuncDetour(CInstance* Self, CInstance* Other, Y
 {
 	auto start = std::chrono::high_resolution_clock::now();
 
-	int beforeDamageCalculationStructHash = baseMobVarIndexMap[0];
-	RValue* beforeDamageCalculationStructRef = nullptr;
-	Self->m_yyvarsMap->FindElement(beforeDamageCalculationStructHash, beforeDamageCalculationStructRef);
-	YYObjectBase* beforeDamageCalculationStruct = beforeDamageCalculationStructRef->Object;
-	if (!(beforeDamageCalculationStruct->m_yyvarsMap) || beforeDamageCalculationStruct->m_yyvarsMap->m_numUsed == 0)
-	{
-		ReturnValue->Kind = Args[2]->Kind;
-		ReturnValue->Object = Args[2]->Object;
-		auto end = std::chrono::high_resolution_clock::now();
-		beforeDamageCalculationQuickFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-		beforeDamageCalculationQuickNumTimes++;
-		return Args[2];
-	}
+	auto setFuncParams = [](RValue* paramArr, YYRValue** Args, CInstance* Self) {
+		paramArr[0] = *(Args[0]);
+		paramArr[1] = *(Args[1]);
+		paramArr[2] = *(Args[2]);
+	};
 
-	int baseMobArrHash = baseMobVarIndexMap[1000];
-	RValue* baseMobArrRef = nullptr;
-	Self->m_yyvarsMap->FindElement(baseMobArrHash, baseMobArrRef);
-	RValue* prevRefArr = baseMobArrRef->RefArray->m_Array;
-	int prevRefArrLength = baseMobArrRef->RefArray->length;
-	RValue* paramArr = baseMobArrRef->RefArray->m_Array = curFuncParamArr[curFuncParamDepth];
-	baseMobArrRef->RefArray->length = 10;
-	curFuncParamDepth++;
+	int numParams = 4;
+	int structIndex = 0;
+	int returnArgIndex = 2;
 
-	scriptExecuteArgsArray[1].Kind = VALUE_ARRAY;
-	scriptExecuteArgsArray[1].RefArray = baseMobArrRef->RefArray;
-	scriptExecuteArgsArray[2].Kind = VALUE_REAL;
-	scriptExecuteArgsArray[2].Real = 0;
-	scriptExecuteArgsArray[3].Kind = VALUE_REAL;
-	scriptExecuteArgsArray[3].Real = 3;
+	RunStructFunctions(Self, Other, ReturnValue, numArgs, Args, setFuncParams, numParams, structIndex, returnArgIndex);
 
-	for (int i = 0; i < beforeDamageCalculationStruct->m_yyvarsMap->m_curSize; i++)
-	{
-		if (beforeDamageCalculationStruct->m_yyvarsMap->m_pBuckets[i].Hash != 0)
-		{
-			RValue* curValue = beforeDamageCalculationStruct->m_yyvarsMap->m_pBuckets[i].v;
-			RValue returnValue;
-
-			scriptExecuteArgsArray[0] = *curValue;
-
-			paramArr[0] = *(Args[0]);
-			paramArr[1] = *(Args[1]);
-			paramArr[2] = *(Args[2]);
-
-			scriptExecuteFunc(&returnValue, Self, Other, 4, scriptExecuteArgsArray);
-			Args[2]->Real = returnValue.Real;
-		}
-	}
-	baseMobArrRef->RefArray->m_Array = prevRefArr;
-	baseMobArrRef->RefArray->length = prevRefArrLength;
-	curFuncParamDepth--;
-
-	ReturnValue->Kind = Args[2]->Kind;
-	ReturnValue->Real = Args[2]->Real;
 	auto end = std::chrono::high_resolution_clock::now();
 	beforeDamageCalculationSlowFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 	beforeDamageCalculationSlowNumTimes++;
@@ -1087,11 +907,11 @@ YYTKStatus CodeCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 
 	std::tuple<CInstance*, CInstance*, CCode*, RValue*, int> args = pCodeEvent->Arguments();
 
-	CInstance* Self = std::get<0>(args);
-	CInstance* Other = std::get<1>(args);
-	CCode* Code = std::get<2>(args);
-	RValue* Res = std::get<3>(args);
-	int			Flags = std::get<4>(args);
+	CInstance*	Self	= std::get<0>(args);
+	CInstance*	Other	= std::get<1>(args);
+	CCode*		Code	= std::get<2>(args);
+	RValue*		Res		= std::get<3>(args);
+	int			Flags	= std::get<4>(args);
 
 	if (!Code->i_pName)
 	{
@@ -1727,383 +1547,30 @@ DllExport YYTKStatus PluginEntry(YYTKPlugin* PluginObject)
 		}
 	}
 
-	int spawnMobIndex = -1;
-	int calculateScoreIndex = -1;
-
-	CallBuiltin(Result, "asset_get_index", nullptr, nullptr, { "gml_Script_SpawnMob_gml_Object_obj_MobManager_Create_0" });
-	
-	//Ends up being 7480
-	spawnMobIndex = static_cast<int>(Result) - 100000;
-	PrintMessage(CLR_DEFAULT, "spawnMobIndex: %d", spawnMobIndex);
-
-	CallBuiltin(Result, "asset_get_index", nullptr, nullptr, { "gml_Script_OnTakeDamage_gml_Object_obj_BaseMob_Create_0" });
-
-	//Ends up being 1589
-	calculateScoreIndex = static_cast<int>(Result) - 100000;
-	PrintMessage(CLR_DEFAULT, "calculateScoreIndex: %d", calculateScoreIndex);
-
-	CScript* spawnMobCScript = nullptr;
-	CScript* calculateScoreCScript = nullptr;
-
-	MmGetScriptData(spawnMobCScript, spawnMobIndex);
-
-	PrintMessage(CLR_DEFAULT, "spawnMobCScript: %s %s %p %p", spawnMobCScript->s_name, spawnMobCScript->s_pFunc->pName, spawnMobCScript->s_pFunc->pFunc, spawnMobCScript->s_pFunc->pFuncVar);
-
-	MmGetScriptData(calculateScoreCScript, calculateScoreIndex);
-
-	PrintMessage(CLR_DEFAULT, "calculateScoreCScript: %s %s %p %p", calculateScoreCScript->s_name, calculateScoreCScript->s_pFunc->pName, calculateScoreCScript->s_pFunc->pFunc, calculateScoreCScript->s_pFunc->pFuncVar);
-	
+	GetFunctionByName("asset_get_index", assetGetIndexFunc);
 	MH_Initialize();
-	auto Hook = [](void* NewFunc, void* TargetFuncPointer, void** pfnOriginal, const char* Name)
-	{
-		if (TargetFuncPointer)
-		{
-			auto Status = MH_CreateHook(TargetFuncPointer, NewFunc, pfnOriginal);
-			if (Status != MH_OK)
-				PrintMessage(
-					CLR_RED,
-					"Failed to hook function %s (MH Status %s) in %s at line %d",
-					Name,
-					MH_StatusToString(Status),
-					__FILE__,
-					__LINE__
-				);
-			else
-				MH_EnableHook(TargetFuncPointer);
-
-			PrintMessage(CLR_GRAY, "- &%s = 0x%p", Name, TargetFuncPointer);
-		}
-		else
-		{
-			PrintMessage(
-				CLR_RED,
-				"Failed to hook function %s (address not found) in %s at line %d",
-				Name,
-				__FILE__,
-				__LINE__
-			);
-		}
-	};
-	/*
-	typedef YYRValue* (*ScriptFunc)(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args);
-
-	ScriptFunc origSpawnMobScript = nullptr;
-
-	auto spawnMobFuncDetour = [origSpawnMobScript](CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args) -> YYRValue*
-	{
-		PrintMessage(CLR_DEFAULT, "Detoured mob script");
-		return origSpawnMobScript(Self, Other, ReturnValue, numArgs, Args);
-	};
-	*/
-
-	Hook(
-		(void*)&spawnMobFuncDetour,
-		(void*)(spawnMobCScript->s_pFunc->pScriptFunc),
-		(void**)&origSpawnMobScript,
-		"spawnMobScript"
-	);
-
-	/*
-	ScriptFunc origCalculateScoreScript = nullptr;
-
-	auto calculateScoreFuncDetour = [origCalculateScoreScript](CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args) -> YYRValue*
-	{
-		PrintMessage(CLR_DEFAULT, "Detoured calculate score script");
-		return origCalculateScoreScript(Self, Other, ReturnValue, numArgs, Args);
-	};
-	*/
-
-	Hook(
-		(void*)&OnTakeDamageFuncDetour,
-		(void*)(calculateScoreCScript->s_pFunc->pScriptFunc),
-		(void**)&origOnTakeDamageScript,
-		"OnTakeDamageScript"
-	);
-
-	CallBuiltin(Result, "asset_get_index", nullptr, nullptr, { "gml_Script_ApplyOnHitEffects_gml_Object_obj_BaseMob_Create_0" });
-
-	int applyOnHitEffectsIndex = static_cast<int>(Result) - 100000;
-
-	CScript* applyOnHitEffectsCScript = nullptr;
-
-	MmGetScriptData(applyOnHitEffectsCScript, applyOnHitEffectsIndex);
-
-	Hook(
-		(void*)&ApplyOnHitEffectsFuncDetour,
-		(void*)(applyOnHitEffectsCScript->s_pFunc->pScriptFunc),
-		(void**)&origApplyOnHitEffectsScript,
-		"ApplyOnHitEffectsScript"
-	);
-
-	CallBuiltin(Result, "asset_get_index", nullptr, nullptr, { "gml_Script_ApplyKnockback_gml_Object_obj_BaseMob_Create_0" });
-
-	int applyKnockbackIndex = static_cast<int>(Result) - 100000;
-
-	CScript* applyKnockbackCScript = nullptr;
-
-	MmGetScriptData(applyKnockbackCScript, applyKnockbackIndex);
-
-	Hook(
-		(void*)&ApplyKnockbackFuncDetour,
-		(void*)(applyKnockbackCScript->s_pFunc->pScriptFunc),
-		(void**)&origApplyKnockbackScript,
-		"ApplyKnockbackScript"
-	);
-
-	CallBuiltin(Result, "asset_get_index", nullptr, nullptr, { "gml_Script_ApplyStatusEffects_gml_Object_obj_BaseMob_Create_0" });
-
-	int applyStatusEffectsIndex = static_cast<int>(Result) - 100000;
-
-	CScript* applyStatusEffectsCScript = nullptr;
-
-	MmGetScriptData(applyStatusEffectsCScript, applyStatusEffectsIndex);
-
-	Hook(
-		(void*)&ApplyStatusEffectsFuncDetour,
-		(void*)(applyStatusEffectsCScript->s_pFunc->pScriptFunc),
-		(void**)&origApplyStatusEffectsScript,
-		"ApplyStatusEffectsScript"
-	);
-
-	CallBuiltin(Result, "asset_get_index", nullptr, nullptr, { "gml_Script_OnTakeDamageAfter_gml_Object_obj_BaseMob_Create_0" });
-
-	int onTakeDamageAfterIndex = static_cast<int>(Result) - 100000;
-
-	CScript* onTakeDamageAfterCScript = nullptr;
-
-	MmGetScriptData(onTakeDamageAfterCScript, onTakeDamageAfterIndex);
-
-	Hook(
-		(void*)&OnTakeDamageAfterFuncDetour,
-		(void*)(onTakeDamageAfterCScript->s_pFunc->pScriptFunc),
-		(void**)&origOnTakeDamageAfterScript,
-		"OnTakeDamageAfterScript"
-	);
-
-	CallBuiltin(Result, "asset_get_index", nullptr, nullptr, { "gml_Script_OnDodge_gml_Object_obj_BaseMob_Create_0" });
-
-	int onDodgeIndex = static_cast<int>(Result) - 100000;
-
-	CScript* onDodgeCScript = nullptr;
-
-	MmGetScriptData(onDodgeCScript, onDodgeIndex);
-
-	Hook(
-		(void*)&OnDodgeFuncDetour,
-		(void*)(onDodgeCScript->s_pFunc->pScriptFunc),
-		(void**)&origOnDodgeScript,
-		"OnDodgeScript"
-	);
-
-	CallBuiltin(Result, "asset_get_index", nullptr, nullptr, { "gml_Script_ApplyDamage_gml_Object_obj_BaseMob_Create_0" });
-
-	int applyDamageIndex = static_cast<int>(Result) - 100000;
-
-	CScript* applyDamageCScript = nullptr;
-
-	MmGetScriptData(applyDamageCScript, applyDamageIndex);
-
-	Hook(
-		(void*)&ApplyDamageFuncDetour,
-		(void*)(applyDamageCScript->s_pFunc->pScriptFunc),
-		(void**)&origApplyDamageScript,
-		"ApplyDamageScript"
-	);
-
-	CallBuiltin(Result, "asset_get_index", nullptr, nullptr, { "gml_Script_HitNumber_gml_Object_obj_BaseMob_Create_0" });
-
-	int hitNumberIndex = static_cast<int>(Result) - 100000;
-
-	CScript* hitNumberCScript = nullptr;
-
-	MmGetScriptData(hitNumberCScript, hitNumberIndex);
-
-	Hook(
-		(void*)&HitNumberFuncDetour,
-		(void*)(hitNumberCScript->s_pFunc->pScriptFunc),
-		(void**)&origHitNumberScript,
-		"HitNumberScript"
-	);
-
-	CallBuiltin(Result, "asset_get_index", nullptr, nullptr, { "gml_Script_OnKillingHit_gml_Object_obj_BaseMob_Create_0" });
-
-	int onKillingHitIndex = static_cast<int>(Result) - 100000;
-
-	CScript* onKillingHitCScript = nullptr;
-
-	MmGetScriptData(onKillingHitCScript, onKillingHitIndex);
-
-	Hook(
-		(void*)&OnKillingHitFuncDetour,
-		(void*)(onKillingHitCScript->s_pFunc->pScriptFunc),
-		(void**)&origOnKillingHitScript,
-		"OnKillingHitScript"
-	);
-
-	CallBuiltin(Result, "asset_get_index", nullptr, nullptr, { "gml_Script_PushDamageData" });
-
-	int pushDamageDataIndex = static_cast<int>(Result) - 100000;
-
-	CScript* pushDamageDataCScript = nullptr;
-
-	MmGetScriptData(pushDamageDataCScript, pushDamageDataIndex);
-
-	Hook(
-		(void*)&PushDamageDataFuncDetour,
-		(void*)(pushDamageDataCScript->s_pFunc->pScriptFunc),
-		(void**)&origPushDamageDataScript,
-		"PushDamageDataScript"
-	);
-
-	CallBuiltin(Result, "asset_get_index", nullptr, nullptr, { "gml_Script_soundPlay" });
-
-	int soundPlayIndex = static_cast<int>(Result) - 100000;
-
-	CScript* soundPlayCScript = nullptr;
-
-	MmGetScriptData(soundPlayCScript, soundPlayIndex);
-
-	Hook(
-		(void*)&SoundPlayFuncDetour,
-		(void*)(soundPlayCScript->s_pFunc->pScriptFunc),
-		(void**)&origSoundPlayScript,
-		"SoundPlayScript"
-	);
-
-	CallBuiltin(Result, "asset_get_index", nullptr, nullptr, { "gml_Script_ApplyHitEffect_gml_Object_obj_BaseMob_Create_0" });
-
-	int applyHitEffectIndex = static_cast<int>(Result) - 100000;
-
-	CScript* applyHitEffectCScript = nullptr;
-
-	MmGetScriptData(applyHitEffectCScript, applyHitEffectIndex);
-
-	Hook(
-		(void*)&ApplyHitEffectFuncDetour,
-		(void*)(applyHitEffectCScript->s_pFunc->pScriptFunc),
-		(void**)&origApplyHitEffectScript,
-		"ApplyHitEffectScript"
-	);
-
-	CallBuiltin(Result, "asset_get_index", nullptr, nullptr, { "gml_Script_Die_gml_Object_obj_Enemy_Create_0" });
-
-	int dieIndex = static_cast<int>(Result) - 100000;
-
-	CScript* dieCScript = nullptr;
-
-	MmGetScriptData(dieCScript, dieIndex);
-
-	Hook(
-		(void*)&DieFuncDetour,
-		(void*)(dieCScript->s_pFunc->pScriptFunc),
-		(void**)&origDieScript,
-		"DieScript"
-	);
-
-	CallBuiltin(Result, "asset_get_index", nullptr, nullptr, { "gml_Script_HitTarget_gml_Object_obj_Attack_Create_0" });
-
-	int hitTargetIndex = static_cast<int>(Result) - 100000;
-
-	CScript* hitTargetCScript = nullptr;
-
-	MmGetScriptData(hitTargetCScript, hitTargetIndex);
-
-	Hook(
-		(void*)&HitTargetFuncDetour,
-		(void*)(hitTargetCScript->s_pFunc->pScriptFunc),
-		(void**)&origHitTargetScript,
-		"HitTargetScript"
-	);
-
-	CallBuiltin(Result, "asset_get_index", nullptr, nullptr, { "gml_Script_TakeDamage_gml_Object_obj_BaseMob_Create_0" });
-
-	int takeDamageIndex = static_cast<int>(Result) - 100000;
-
-	CScript* takeDamageCScript = nullptr;
-
-	MmGetScriptData(takeDamageCScript, takeDamageIndex);
-
-	Hook(
-		(void*)&TakeDamageFuncDetour,
-		(void*)(takeDamageCScript->s_pFunc->pScriptFunc),
-		(void**)&origTakeDamageScript,
-		"TakeDamageScript"
-	);
-
-	CallBuiltin(Result, "asset_get_index", nullptr, nullptr, { "gml_Script_CalculateDamage_gml_Object_obj_AttackController_Create_0" });
-
-	int calculateDamageIndex = static_cast<int>(Result) - 100000;
-
-	CScript* calculateDamageCScript = nullptr;
-
-	MmGetScriptData(calculateDamageCScript, calculateDamageIndex);
-
-	Hook(
-		(void*)&CalculateDamageFuncDetour,
-		(void*)(calculateDamageCScript->s_pFunc->pScriptFunc),
-		(void**)&origCalculateDamageScript ,
-		"CalculateDamageScript"
-	);
-
-	CallBuiltin(Result, "asset_get_index", nullptr, nullptr, { "gml_Script_OnCriticalHit_gml_Object_obj_BaseMob_Create_0" });
-
-	int onCriticalHitIndex = static_cast<int>(Result) - 100000;
-
-	CScript* onCriticalHitCScript = nullptr;
-
-	MmGetScriptData(onCriticalHitCScript, onCriticalHitIndex);
-
-	Hook(
-		(void*)&OnCriticalHitFuncDetour,
-		(void*)(onCriticalHitCScript->s_pFunc->pScriptFunc),
-		(void**)&origOnCriticalHitScript,
-		"OnCriticalHitScript"
-	);
-
-	CallBuiltin(Result, "asset_get_index", nullptr, nullptr, { "gml_Script_AfterCriticalHit_gml_Object_obj_BaseMob_Create_0" });
-
-	int afterCriticalHitIndex = static_cast<int>(Result) - 100000;
-
-	CScript* afterCriticalHitCScript = nullptr;
-
-	MmGetScriptData(afterCriticalHitCScript, afterCriticalHitIndex);
-
-	Hook(
-		(void*)&AfterCriticalHitFuncDetour,
-		(void*)(afterCriticalHitCScript->s_pFunc->pScriptFunc),
-		(void**)&origAfterCriticalHitScript,
-		"AfterCriticalHitScript"
-	);
-
-	CallBuiltin(Result, "asset_get_index", nullptr, nullptr, { "gml_Script_BeforeDamageCalculation_gml_Object_obj_BaseMob_Create_0" });
-
-	int beforeDamageCalculationHitIndex = static_cast<int>(Result) - 100000;
-
-	CScript* beforeDamageCalculationCScript = nullptr;
-
-	MmGetScriptData(beforeDamageCalculationCScript, beforeDamageCalculationHitIndex);
-
-	Hook(
-		(void*)&BeforeDamageCalculationFuncDetour,
-		(void*)(beforeDamageCalculationCScript->s_pFunc->pScriptFunc),
-		(void**)&origBeforeDamageCalculationScript,
-		"BeforeDamageCalculationScript"
-	);
-
-	CallBuiltin(Result, "asset_get_index", nullptr, nullptr, { "gml_Script_DropExp_gml_Object_obj_Enemy_Create_0" });
-
-	int dropEXPIndex = static_cast<int>(Result) - 100000;
-
-	CScript* dropEXPCScript = nullptr;
-
-	MmGetScriptData(dropEXPCScript, dropEXPIndex);
-
-	Hook(
-		(void*)&DropEXPFuncDetour,
-		(void*)(dropEXPCScript->s_pFunc->pScriptFunc),
-		(void**)&origDropEXPScript,
-		"DropEXPScript"
-	);
+	MmGetScriptData(scriptList);
+
+	HookScriptFunction("gml_Script_OnTakeDamage_gml_Object_obj_BaseMob_Create_0",				(void*)&OnTakeDamageFuncDetour,				(void**)&origOnTakeDamageScript);
+	HookScriptFunction("gml_Script_ApplyOnHitEffects_gml_Object_obj_BaseMob_Create_0",			(void*)&ApplyOnHitEffectsFuncDetour,		(void**)&origApplyOnHitEffectsScript);
+	HookScriptFunction("gml_Script_ApplyKnockback_gml_Object_obj_BaseMob_Create_0",				(void*)&ApplyKnockbackFuncDetour,			(void**)&origApplyKnockbackScript);
+	HookScriptFunction("gml_Script_ApplyStatusEffects_gml_Object_obj_BaseMob_Create_0",			(void*)&ApplyStatusEffectsFuncDetour,		(void**)&origApplyStatusEffectsScript);
+	HookScriptFunction("gml_Script_OnTakeDamageAfter_gml_Object_obj_BaseMob_Create_0",			(void*)&OnTakeDamageAfterFuncDetour,		(void**)&origOnTakeDamageAfterScript);
+	HookScriptFunction("gml_Script_OnDodge_gml_Object_obj_BaseMob_Create_0",					(void*)&OnDodgeFuncDetour,					(void**)&origOnDodgeScript);
+	HookScriptFunction("gml_Script_ApplyDamage_gml_Object_obj_BaseMob_Create_0",				(void*)&ApplyDamageFuncDetour,				(void**)&origApplyDamageScript);
+	HookScriptFunction("gml_Script_HitNumber_gml_Object_obj_BaseMob_Create_0",					(void*)&HitNumberFuncDetour,				(void**)&origHitNumberScript);
+	HookScriptFunction("gml_Script_OnKillingHit_gml_Object_obj_BaseMob_Create_0",				(void*)&OnKillingHitFuncDetour,				(void**)&origOnKillingHitScript);
+	HookScriptFunction("gml_Script_PushDamageData",												(void*)&PushDamageDataFuncDetour,			(void**)&origPushDamageDataScript);
+	HookScriptFunction("gml_Script_soundPlay",													(void*)&SoundPlayFuncDetour,				(void**)&origSoundPlayScript);
+	HookScriptFunction("gml_Script_ApplyHitEffect_gml_Object_obj_BaseMob_Create_0",				(void*)&ApplyHitEffectFuncDetour,			(void**)&origApplyHitEffectScript);
+	HookScriptFunction("gml_Script_Die_gml_Object_obj_Enemy_Create_0",							(void*)&DieFuncDetour,						(void**)&origDieScript);
+	HookScriptFunction("gml_Script_HitTarget_gml_Object_obj_Attack_Create_0",					(void*)&HitTargetFuncDetour,				(void**)&origHitTargetScript);
+	HookScriptFunction("gml_Script_TakeDamage_gml_Object_obj_BaseMob_Create_0",					(void*)&TakeDamageFuncDetour,				(void**)&origTakeDamageScript);
+	HookScriptFunction("gml_Script_CalculateDamage_gml_Object_obj_AttackController_Create_0",	(void*)&CalculateDamageFuncDetour,			(void**)&origCalculateDamageScript);
+	HookScriptFunction("gml_Script_OnCriticalHit_gml_Object_obj_BaseMob_Create_0",				(void*)&OnCriticalHitFuncDetour,			(void**)&origOnCriticalHitScript);
+	HookScriptFunction("gml_Script_AfterCriticalHit_gml_Object_obj_BaseMob_Create_0",			(void*)&AfterCriticalHitFuncDetour,			(void**)&origAfterCriticalHitScript);
+	HookScriptFunction("gml_Script_BeforeDamageCalculation_gml_Object_obj_BaseMob_Create_0",	(void*)&BeforeDamageCalculationFuncDetour,	(void**)&origBeforeDamageCalculationScript);
+	HookScriptFunction("gml_Script_DropExp_gml_Object_obj_Enemy_Create_0",						(void*)&DropEXPFuncDetour,					(void**)&origDropEXPScript);
 
 	GetFunctionByName("method_call", scriptExecuteFunc);
 

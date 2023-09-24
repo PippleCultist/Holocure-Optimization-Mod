@@ -15,6 +15,8 @@
 using FNScriptData = CScript * (*)(int);
 FNScriptData scriptList = nullptr;
 TRoutine assetGetIndexFunc;
+TRoutine variableGetHashFunc;
+CInstance* globalInstancePtr = nullptr;
 
 YYTKStatus MmGetScriptData(FNScriptData& outScript)
 {
@@ -150,7 +152,6 @@ static uint32_t LastRainbowEXPFrameNumber = 0;
 static uint32_t NumberOfEnemiesCreated = 0;
 static uint32_t NumberOfEnemyDeadCreated = 0;
 static bool printScripts = true;
-static int EnemyIndex = -1;
 static int PlayerScreenXOffset = 320;
 static int PlayerScreenYOffset = 196;
 static int CameraXPos = -1;
@@ -198,8 +199,7 @@ static std::unordered_map<int, int> bucketGridMap;
 
 static int enemyVarIndexMap[1001];
 static int baseMobVarIndexMap[1001];
-static bool hasSetEnemyVarIndexMap = false;
-static bool hasSetBaseMobVarIndexMap = false;
+static int attackIndexMap[1001];
 
 static std::vector<std::pair<long long, int>> sortVec;
 
@@ -351,19 +351,184 @@ YYRValue* OnTakeDamageFuncDetour(CInstance* Self, CInstance* Other, YYRValue* Re
 ScriptFunc origApplyOnHitEffectsScript = nullptr;
 static long long applyOnHitEffectsFuncTime = 0;
 static int applyOnHitEffectsNumTimes = 0;
+static long long applyOnHitEffectsSlowFuncTime = 0;
+static int applyOnHitEffectsSlowNumTimes = 0;
+
+static std::unordered_map<int, RValue> onHitEffectsMap;
+static CInstance* curHitTargetAttackInstance = nullptr;
 
 YYRValue* ApplyOnHitEffectsFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
-	bool prevIsInTakeDamageFunc = isInTakeDamageFunc;
-	isInTakeDamageFunc = false;
 	auto start = std::chrono::high_resolution_clock::now();
-	YYRValue* res = origApplyOnHitEffectsScript(Self, Other, ReturnValue, numArgs, Args);
+	if (Args[1]->Kind == VALUE_UNDEFINED)
+	{
+		ReturnValue->Kind = Args[0]->Kind;
+		ReturnValue->Real = Args[0]->Real;
+		return Args[0];
+	}
+	if (Args[3]->Kind == VALUE_UNDEFINED)
+	{
+		Args[3]->Kind = VALUE_REAL;
+		Args[3]->Real = 0;
+	}
+	
+	// find a way to get meaningful information out of object instance id instead of not handling it
+	if (curHitTargetAttackInstance == nullptr)
+	{
+		ReturnValue->Kind = Args[0]->Kind;
+		ReturnValue->Real = Args[0]->Real;
+		auto end = std::chrono::high_resolution_clock::now();
+		applyOnHitEffectsFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+		applyOnHitEffectsNumTimes++;
+		return Args[0];
+	}
+
+	RValue* isEnemyPtr = nullptr;
+	int isEnemyHash = attackIndexMap[0];
+	curHitTargetAttackInstance->m_yyvarsMap->FindElement(isEnemyHash, isEnemyPtr);
+	RValue* creatorPtr = nullptr;
+	int creatorHash = attackIndexMap[1];
+	curHitTargetAttackInstance->m_yyvarsMap->FindElement(creatorHash, creatorPtr);
+	RValue* onHitEffectsPtr = nullptr;
+	int onHitEffectsHash = attackIndexMap[3];
+	curHitTargetAttackInstance->m_yyvarsMap->FindElement(onHitEffectsHash, onHitEffectsPtr);
+	
+	RValue* creatorOnHitEffectsPtr = nullptr;
+	if (isEnemyPtr == nullptr || (creatorPtr != nullptr && isEnemyPtr->Real != 0))
+	{
+		creatorPtr->Object->m_yyvarsMap->FindElement(attackIndexMap[3], creatorOnHitEffectsPtr);
+	}
+
+	if (onHitEffectsPtr == nullptr)
+	{
+		ReturnValue->Kind = Args[0]->Kind;
+		ReturnValue->Real = Args[0]->Real;
+		return Args[0];
+	}
+	bool hasAllHashes = true;
+	std::unordered_map<int, RValue*> onHitIdsHashMap;
+
+	CHashMap<int, RValue*>* creatorOnHitEffectMap = nullptr;
+	if (creatorOnHitEffectsPtr != nullptr && (creatorOnHitEffectMap = creatorOnHitEffectsPtr->Object->m_yyvarsMap) != nullptr)
+	{
+		for (int i = 0; i < creatorOnHitEffectMap->m_curSize; i++)
+		{
+			auto curElement = creatorOnHitEffectMap->m_pBuckets[i];
+			int curHash = curElement.Hash;
+			if (curHash != 0)
+			{
+				if (onHitEffectsMap.count(curHash) == 0)
+				{
+					hasAllHashes = false;
+					break;
+				}
+				onHitIdsHashMap[curHash] = curElement.v;
+			}
+		}
+	}
+
+	CHashMap<int, RValue*>* curOnHitEffectsMap = nullptr;
+
+	if (hasAllHashes && (curOnHitEffectsMap = onHitEffectsPtr->Object->m_yyvarsMap) != nullptr)
+	{
+		for (int i = 0; i < curOnHitEffectsMap->m_curSize; i++)
+		{
+			auto curElement = curOnHitEffectsMap->m_pBuckets[i];
+			int curHash = curElement.Hash;
+			if (curHash != 0)
+			{
+				if (onHitEffectsMap.count(curHash) == 0)
+				{
+					hasAllHashes = false;
+					break;
+				}
+				onHitIdsHashMap[curHash] = curElement.v;
+			}
+		}
+	}
+
+	if (!hasAllHashes)
+	{
+		bool prevIsInTakeDamageFunc = isInTakeDamageFunc;
+		isInTakeDamageFunc = false;
+		YYRValue* Res = origApplyOnHitEffectsScript(Self, Other, ReturnValue, numArgs, Args);
+		isInTakeDamageFunc = prevIsInTakeDamageFunc;
+		auto end = std::chrono::high_resolution_clock::now();
+		applyOnHitEffectsSlowFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+		applyOnHitEffectsSlowNumTimes++;
+		return Res;
+	}
+
+	if (onHitIdsHashMap.empty())
+	{
+		ReturnValue->Kind = Args[0]->Kind;
+		ReturnValue->Real = Args[0]->Real;
+		return Args[0];
+	}
+
+	int baseMobArrHash = baseMobVarIndexMap[1000];
+	RValue* baseMobArrRef = nullptr;
+	Self->m_yyvarsMap->FindElement(baseMobArrHash, baseMobArrRef);
+	RValue* prevRefArr = baseMobArrRef->RefArray->m_Array;
+	int prevRefArrLength = baseMobArrRef->RefArray->length;
+	RValue* paramArr = baseMobArrRef->RefArray->m_Array = curFuncParamArr[curFuncParamDepth];
+	baseMobArrRef->RefArray->length = 10;
+	curFuncParamDepth++;
+
+	scriptExecuteArgsArray[1].Kind = VALUE_ARRAY;
+	scriptExecuteArgsArray[1].RefArray = baseMobArrRef->RefArray;
+	scriptExecuteArgsArray[2].Kind = VALUE_REAL;
+	scriptExecuteArgsArray[2].Real = 0;
+	scriptExecuteArgsArray[3].Kind = VALUE_REAL;
+	scriptExecuteArgsArray[3].Real = 6;
+
+	for (auto& it : onHitIdsHashMap)
+	{
+		RValue script = onHitEffectsMap[it.first];
+		RValue* config = it.second;
+		RValue returnValue;
+
+		scriptExecuteArgsArray[0] = script;
+
+		paramArr[0] = *(Args[0]);
+		paramArr[1] = *(Args[1]);
+		paramArr[2] = *(Args[2]);
+		paramArr[3].Kind = VALUE_OBJECT;
+		paramArr[3].Instance = Self;
+		paramArr[4] = *config;
+		paramArr[5] = *(Args[3]);
+
+		scriptExecuteFunc(&returnValue, Self, Other, 4, scriptExecuteArgsArray);
+		Args[0]->Real = returnValue.Real;
+	}
+	baseMobArrRef->RefArray->m_Array = prevRefArr;
+	baseMobArrRef->RefArray->length = prevRefArrLength;
+	curFuncParamDepth--;
+
+	ReturnValue->Kind = Args[0]->Kind;
+	ReturnValue->Real = Args[0]->Real;
+
 	auto end = std::chrono::high_resolution_clock::now();
-	applyOnHitEffectsFuncTime += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+	applyOnHitEffectsFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 	applyOnHitEffectsNumTimes++;
-	isInTakeDamageFunc = prevIsInTakeDamageFunc;
-	return res;
+	return Args[0];
 };
+
+TRoutine origDSMapSetScript = nullptr;
+void DSMapSetDetour(RValue* Result, CInstance* Self, CInstance* Other, int numArgs, RValue* Args)
+{
+	int StructHash = attackIndexMap[2];
+	RValue* StructRef = nullptr;
+	globalInstancePtr->m_yyvarsMap->FindElement(StructHash, StructRef);
+	if (abs(Args[0].Real - StructRef->Real) < 1e-3)
+	{
+		RValue Res;
+		variableGetHashFunc(&Res, nullptr, nullptr, 1, &(Args[1]));
+		int onHitEffectHash = CHashMap<int, RValue>::CalculateHash(static_cast<int>(Res.Real)) % (1ll << 31);
+		onHitEffectsMap[onHitEffectHash] = Args[2];
+	}
+	origDSMapSetScript(Result, Self, Other, numArgs, Args);
+}
 
 ScriptFunc origApplyKnockbackScript = nullptr;
 static long long applyKnockbackFuncTime = 0;
@@ -570,6 +735,11 @@ std::chrono::steady_clock::time_point takeDamageStartTime;
 
 YYRValue* TakeDamageFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
+	CInstance* prevCurHitTargetAttackInstance = curHitTargetAttackInstance;
+	if (!isInHitTarget)
+	{
+		curHitTargetAttackInstance = nullptr;
+	}
 	bool prevIsInHitTarget = isInHitTarget;
 	isInHitTarget = false;
 	auto start = std::chrono::high_resolution_clock::now();
@@ -580,6 +750,7 @@ YYRValue* TakeDamageFuncDetour(CInstance* Self, CInstance* Other, YYRValue* Retu
 	takeDamageFuncTime += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 	takeDamageNumTimes++;
 	isInHitTarget = prevIsInHitTarget;
+	curHitTargetAttackInstance = prevCurHitTargetAttackInstance;
 	return res;
 };
 
@@ -616,6 +787,8 @@ static int hitTargetIndex = -1;
 
 YYRValue* HitTargetFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
+	CInstance* prevCurHitTargetAttackInstance = curHitTargetAttackInstance;
+	curHitTargetAttackInstance = Self;
 	YYRValue Res;
 	hitTargetIndex = Args[0]->Object->m_slot;
 	YYRValue ResOne;
@@ -630,6 +803,7 @@ YYRValue* HitTargetFuncDetour(CInstance* Self, CInstance* Other, YYRValue* Retur
 	hitTargetFuncTime += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 	hitTargetNumTimes++;
 	isInHitTarget = false;
+	curHitTargetAttackInstance = prevCurHitTargetAttackInstance;
 	return res;
 };
 
@@ -814,6 +988,7 @@ YYTKStatus FrameCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 			outFile << "takeDamageFuncTime: " << takeDamageFuncTime << " num times: " << takeDamageNumTimes << "\n";
 			outFile << "onTakeDamage func time: " << onTakeDamageFuncTime << " num times: " << onTakeDamageNumTimes << "\n";
 			outFile << "applyOnHitEffectsFuncTime: " << applyOnHitEffectsFuncTime << " num times: " << applyOnHitEffectsNumTimes << "\n";
+			outFile << "applyOnHitEffectsSlowFuncTime: " << applyOnHitEffectsSlowFuncTime << " num times: " << applyOnHitEffectsSlowNumTimes << "\n";
 			outFile << "applyKnockbackFuncTime: " << applyKnockbackFuncTime << " num times: " << applyKnockbackNumTimes << "\n";
 			outFile << "applyStatusEffectsFuncTime: " << applyStatusEffectsFuncTime << " num times: " << applyStatusEffectsNumTimes << "\n";
 			outFile << "onTakeDamageAfterFuncTime: " << onTakeDamageAfterFuncTime << " num times: " << onTakeDamageAfterNumTimes << "\n";
@@ -891,6 +1066,8 @@ YYTKStatus FrameCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 	beforeDamageCalculationQuickNumTimes = 0;
 	beforeDamageCalculationSlowFuncTime = 0;
 	beforeDamageCalculationSlowNumTimes = 0;
+	applyOnHitEffectsSlowFuncTime = 0;
+	applyOnHitEffectsSlowNumTimes = 0;
 	totTime = 0;
 	ProfilerMap.clear();
 	funcParams.clear();
@@ -974,8 +1151,6 @@ YYTKStatus CodeCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 				attackHitCooldownMap.clear();
 				bucketGridMap.clear();
 				previousFrameBoundingBoxMap.clear();
-				hasSetBaseMobVarIndexMap = false;
-				hasSetEnemyVarIndexMap = false;
 				currentPlayer = PlayerInstance();
 				currentSummon = GMLInstance();
 				pCodeEvent->Call(Self, Other, Code, Res, Flags);
@@ -1068,33 +1243,6 @@ YYTKStatus CodeCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 		else if (_strcmpi(Code->i_pName, "gml_Object_obj_Enemy_Step_0") == 0)
 		{
 			auto Enemy_Step_0 = [](YYTKCodeEvent* pCodeEvent, CInstance* Self, CInstance* Other, CCode* Code, RValue* Res, int Flags) {
-				if (!hasSetEnemyVarIndexMap)
-				{
-					std::vector<const char*> varNames;
-					varNames.push_back("collidedCD");
-					varNames.push_back("lifeTime");
-					varNames.push_back("behaviours");
-					varNames.push_back("isDead");
-					varNames.push_back("tangible");
-					varNames.push_back("moveOutsideCD");
-					varNames.push_back("isKnockback");
-					varNames.push_back("completeStop");
-					varNames.push_back("directionChangeTime");
-					varNames.push_back("lockFacing");
-					varNames.push_back("turnTimer");
-					varNames.push_back("canMove");
-					varNames.push_back("hitCDTimer");
-					varNames.push_back("aliveFor");
-					varNames.push_back("SPD");
-					varNames.push_back("directionMoving");
-					for (int i = 0; i < varNames.size(); i++)
-					{
-						YYRValue Result;
-						CallBuiltin(Result, "variable_get_hash", Self, Other, { varNames[i] });
-						enemyVarIndexMap[i] = CHashMap<int, RValue>::CalculateHash(static_cast<int>(Result.Real)) % (1ll << 31);
-					}
-					hasSetEnemyVarIndexMap = true;
-				}
 				RValue* collidedCDRef = nullptr;
 				Self->m_yyvarsMap->FindElement(enemyVarIndexMap[0], collidedCDRef);
 				RValue* lifeTimeRef = nullptr;
@@ -1245,39 +1393,6 @@ YYTKStatus CodeCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 			};
 			Enemy_Draw_0(pCodeEvent, Self, Other, Code, Res, Flags);
 			codeFuncTable[Code->i_CodeIndex] = Enemy_Draw_0;
-		}
-		else if (_strcmpi(Code->i_pName, "gml_Object_obj_BaseMob_Step_0") == 0)
-		{
-			auto BaseMob_Step_0 = [pCodeEvent](YYTKCodeEvent* pCodeEvent, CInstance* Self, CInstance* Other, CCode* Code, RValue* Res, int Flags) {
-				if (!hasSetBaseMobVarIndexMap)
-				{
-					std::vector<const char*> varNames;
-					varNames.push_back("beforeDamageCalculation");
-					varNames.push_back("afterCriticalHit");
-					varNames.push_back("onCriticalHit");
-					varNames.push_back("onTakeDamage");
-					varNames.push_back("onTakeDamageAfter");
-					varNames.push_back("onDodge");
-					varNames.push_back("invincible");
-					for (int i = 0; i < varNames.size(); i++)
-					{
-						YYRValue Result;
-						CallBuiltin(Result, "variable_get_hash", Self, Other, { varNames[i] });
-						baseMobVarIndexMap[i] = CHashMap<int, RValue>::CalculateHash(static_cast<int>(Result.Real)) % (1ll << 31);
-					}
-					for (int i = 0; i < Self->m_yyvarsMap->m_curSize; i++)
-					{
-						if (Self->m_yyvarsMap->m_pBuckets[i].Hash != 0 && Self->m_yyvarsMap->m_pBuckets[i].v->Kind == VALUE_ARRAY)
-						{
-							baseMobVarIndexMap[1000] = Self->m_yyvarsMap->m_pBuckets[i].Hash;
-							break;
-						}
-					}
-				}
-				hasSetBaseMobVarIndexMap = true;
-			};
-			BaseMob_Step_0(pCodeEvent, Self, Other, Code, Res, Flags);
-			codeFuncTable[Code->i_CodeIndex] = BaseMob_Step_0;
 		}
 		else if (_strcmpi(Code->i_pName, "gml_Object_obj_EXP_Step_0") == 0)
 		{
@@ -1495,16 +1610,6 @@ DllExport YYTKStatus PluginEntry(YYTKPlugin* PluginObject)
 
 	YYRValue Result;
 
-	for (int i = 0; i < 381; i++)
-	{
-		CallBuiltin(Result, "object_get_name", nullptr, nullptr, { (long long)i });
-		if (_strcmpi("obj_Enemy", static_cast<const char*>(Result)) == 0)
-		{
-			PrintMessage(CLR_DEFAULT, "%d %s", i, static_cast<const char*>(Result));
-			EnemyIndex = i;
-		}
-	}
-
 	GetFunctionByName("asset_get_index", assetGetIndexFunc);
 	MH_Initialize();
 	MmGetScriptData(scriptList);
@@ -1549,6 +1654,87 @@ DllExport YYTKStatus PluginEntry(YYTKPlugin* PluginObject)
 		(void**)&origStringScript,
 		"StringScript"
 	);
+
+	TRoutine dsMapSetScript;
+	GetFunctionByName("ds_map_set", dsMapSetScript);
+	Hook(
+		(void*)&DSMapSetDetour,
+		(void*)(dsMapSetScript),
+		(void**)&origDSMapSetScript,
+		"dsMapSetScript"
+	);
+
+	TRoutine globalScript;
+	GetFunctionByName("@@GlobalScope@@", globalScript);
+	{
+		RValue Res;
+		globalScript(&Res, nullptr, nullptr, 0, nullptr);
+		globalInstancePtr = Res.Instance;
+	}
+
+	GetFunctionByName("variable_get_hash", variableGetHashFunc);
+
+	std::vector<const char*> varNames;
+	varNames.push_back("collidedCD");
+	varNames.push_back("lifeTime");
+	varNames.push_back("behaviours");
+	varNames.push_back("isDead");
+	varNames.push_back("tangible");
+	varNames.push_back("moveOutsideCD");
+	varNames.push_back("isKnockback");
+	varNames.push_back("completeStop");
+	varNames.push_back("directionChangeTime");
+	varNames.push_back("lockFacing");
+	varNames.push_back("turnTimer");
+	varNames.push_back("canMove");
+	varNames.push_back("hitCDTimer");
+	varNames.push_back("aliveFor");
+	varNames.push_back("SPD");
+	varNames.push_back("directionMoving");
+	for (int i = 0; i < varNames.size(); i++)
+	{
+		RValue Res;
+		RValue arg{};
+		arg.Kind = VALUE_STRING;
+		arg.String = RefString::Alloc(varNames[i], strlen(varNames[i]));
+		variableGetHashFunc(&Res, nullptr, nullptr, 1, &arg);
+		enemyVarIndexMap[i] = CHashMap<int, RValue>::CalculateHash(static_cast<int>(Res.Real)) % (1ll << 31);
+	}
+	varNames.clear();
+
+	varNames.push_back("beforeDamageCalculation");
+	varNames.push_back("afterCriticalHit");
+	varNames.push_back("onCriticalHit");
+	varNames.push_back("onTakeDamage");
+	varNames.push_back("onTakeDamageAfter");
+	varNames.push_back("onDodge");
+	varNames.push_back("invincible");
+	for (int i = 0; i < varNames.size(); i++)
+	{
+		RValue Res;
+		RValue arg{};
+		arg.Kind = VALUE_STRING;
+		arg.String = RefString::Alloc(varNames[i], strlen(varNames[i]));
+		variableGetHashFunc(&Res, nullptr, nullptr, 1, &arg);
+		baseMobVarIndexMap[i] = CHashMap<int, RValue>::CalculateHash(static_cast<int>(Res.Real)) % (1ll << 31);
+	}
+	CallBuiltin(Result, "variable_get_hash", nullptr, nullptr, { "debuffDisplay" });
+	baseMobVarIndexMap[1000] = CHashMap<int, RValue>::CalculateHash(static_cast<int>(Result.Real)) % (1ll << 31);
+	varNames.clear();
+
+	varNames.push_back("isEnemy");
+	varNames.push_back("creator");
+	varNames.push_back("OnHitEffects");
+	varNames.push_back("onHitEffects");
+	for (int i = 0; i < varNames.size(); i++)
+	{
+		RValue Res;
+		RValue arg{};
+		arg.Kind = VALUE_STRING;
+		arg.String = RefString::Alloc(varNames[i], strlen(varNames[i]));
+		variableGetHashFunc(&Res, nullptr, nullptr, 1, &arg);
+		attackIndexMap[i] = CHashMap<int, RValue>::CalculateHash(static_cast<int>(Res.Real)) % (1ll << 31);
+	}
 
 	CallBuiltin(Result, "show_debug_overlay", nullptr, nullptr, { true });
 

@@ -1070,7 +1070,6 @@ YYTKStatus CodeCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 			auto Enemy_Step_0 = [](YYTKCodeEvent* pCodeEvent, CInstance* Self, CInstance* Other, CCode* Code, RValue* Res, int Flags) {
 				if (!hasSetEnemyVarIndexMap)
 				{
-					std::vector<YYRValue> prevVar;
 					std::vector<const char*> varNames;
 					varNames.push_back("collidedCD");
 					varNames.push_back("lifeTime");
@@ -1091,28 +1090,8 @@ YYTKStatus CodeCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 					for (int i = 0; i < varNames.size(); i++)
 					{
 						YYRValue Result;
-						prevVar.push_back(YYRValue());
-						CallBuiltin(prevVar[i], "variable_instance_get", Self, Other, { (long long)Self->i_id, varNames[i] });
-						CallBuiltin(Result, "variable_instance_set", Self, Other, { (long long)Self->i_id, varNames[i], varNames[i] });
-					}
-					for (int i = 0; i < Self->m_yyvarsMap->m_curSize; i++)
-					{
-						if (Self->m_yyvarsMap->m_pBuckets[i].Hash != 0 && Self->m_yyvarsMap->m_pBuckets[i].v->Kind == VALUE_STRING)
-						{
-							for (int j = 0; j < varNames.size(); j++)
-							{
-								if (_strcmpi(varNames[j], Self->m_yyvarsMap->m_pBuckets[i].v->String->m_Thing) == 0)
-								{
-									enemyVarIndexMap[j] = Self->m_yyvarsMap->m_pBuckets[i].Hash;
-									break;
-								}
-							}
-						}
-					}
-					for (int i = 0; i < varNames.size(); i++)
-					{
-						YYRValue Result;
-						CallBuiltin(Result, "variable_instance_set", Self, Other, { (long long)Self->i_id, varNames[i], prevVar[i] });
+						CallBuiltin(Result, "variable_get_hash", Self, Other, { varNames[i] });
+						enemyVarIndexMap[i] = CHashMap<int, RValue>::CalculateHash(static_cast<int>(Result.Real)) % (1ll << 31);
 					}
 					hasSetEnemyVarIndexMap = true;
 				}
@@ -1272,7 +1251,6 @@ YYTKStatus CodeCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 			auto BaseMob_Step_0 = [pCodeEvent](YYTKCodeEvent* pCodeEvent, CInstance* Self, CInstance* Other, CCode* Code, RValue* Res, int Flags) {
 				if (!hasSetBaseMobVarIndexMap)
 				{
-					std::vector<YYRValue> prevVar;
 					std::vector<const char*> varNames;
 					varNames.push_back("beforeDamageCalculation");
 					varNames.push_back("afterCriticalHit");
@@ -1284,28 +1262,8 @@ YYTKStatus CodeCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 					for (int i = 0; i < varNames.size(); i++)
 					{
 						YYRValue Result;
-						prevVar.push_back(YYRValue());
-						CallBuiltin(prevVar[i], "variable_instance_get", Self, Other, { (long long)Self->i_id, varNames[i] });
-						CallBuiltin(Result, "variable_instance_set", Self, Other, { (long long)Self->i_id, varNames[i], varNames[i] });
-					}
-					for (int i = 0; i < Self->m_yyvarsMap->m_curSize; i++)
-					{
-						if (Self->m_yyvarsMap->m_pBuckets[i].Hash != 0 && Self->m_yyvarsMap->m_pBuckets[i].v->Kind == VALUE_STRING)
-						{
-							for (int j = 0; j < varNames.size(); j++)
-							{
-								if (_strcmpi(varNames[j], Self->m_yyvarsMap->m_pBuckets[i].v->String->m_Thing) == 0)
-								{
-									baseMobVarIndexMap[j] = Self->m_yyvarsMap->m_pBuckets[i].Hash;
-									break;
-								}
-							}
-						}
-					}
-					for (int i = 0; i < varNames.size(); i++)
-					{
-						YYRValue Result;
-						CallBuiltin(Result, "variable_instance_set", Self, Other, { (long long)Self->i_id, varNames[i], prevVar[i] });
+						CallBuiltin(Result, "variable_get_hash", Self, Other, { varNames[i] });
+						baseMobVarIndexMap[i] = CHashMap<int, RValue>::CalculateHash(static_cast<int>(Result.Real)) % (1ll << 31);
 					}
 					for (int i = 0; i < Self->m_yyvarsMap->m_curSize; i++)
 					{

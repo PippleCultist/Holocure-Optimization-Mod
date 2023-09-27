@@ -56,7 +56,7 @@ void Hook(void* NewFunc, void* TargetFuncPointer, void** pfnOriginal, const char
 		else
 			MH_EnableHook(TargetFuncPointer);
 
-//		PrintMessage(CLR_GRAY, "- &%s = 0x%p", Name, TargetFuncPointer);
+		PrintMessage(CLR_GRAY, "- &%s = 0x%p", Name, TargetFuncPointer);
 	}
 	else
 	{
@@ -703,13 +703,17 @@ ScriptFunc origDieScript = nullptr;
 static long long dieFuncTime = 0;
 static int dieNumTimes = 0;
 
+static bool isInDieFunc = false;
+
 YYRValue* DieFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
+	isInDieFunc = true;
 	auto start = std::chrono::high_resolution_clock::now();
 	YYRValue* res = origDieScript(Self, Other, ReturnValue, numArgs, Args);
 	auto end = std::chrono::high_resolution_clock::now();
 	dieFuncTime += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 	dieNumTimes++;
+	isInDieFunc = false;
 	return res;
 };
 
@@ -912,6 +916,29 @@ void StringDetour(RValue* Result, CInstance* Self, CInstance* Other, int numArgs
 		return;
 	}
 	origStringScript(Result, Self, Other, numArgs, Args);
+}
+
+TRoutine origVariableInstanceGetNamesScript = nullptr;
+void VariableInstanceGetNamesDetour(RValue* Result, CInstance* Self, CInstance* Other, int numArgs, RValue* Args)
+{
+	if (isInDieFunc)
+	{
+		Result->Kind = VALUE_UNSET;
+		return;
+	}
+	origVariableInstanceGetNamesScript(Result, Self, Other, numArgs, Args);
+}
+
+TRoutine origArrayLengthScript = nullptr;
+void ArrayLengthDetour(RValue* Result, CInstance* Self, CInstance* Other, int numArgs, RValue* Args)
+{
+	if (Args[0].Kind == VALUE_UNSET)
+	{
+		Result->Kind = VALUE_REAL;
+		Result->Real = 0;
+		return;
+	}
+	origArrayLengthScript(Result, Self, Other, numArgs, Args);
 }
 
 ScriptFunc origOnCriticalHitScript = nullptr;
@@ -1740,6 +1767,24 @@ DllExport YYTKStatus PluginEntry(YYTKPlugin* PluginObject)
 		(void*)(dsMapSetScript),
 		(void**)&origDSMapSetScript,
 		"dsMapSetScript"
+	);
+
+	TRoutine variableInstanceGetNames;
+	GetFunctionByName("variable_instance_get_names", variableInstanceGetNames);
+	Hook(
+		(void*)&VariableInstanceGetNamesDetour,
+		(void*)(variableInstanceGetNames),
+		(void**)&origVariableInstanceGetNamesScript,
+		"VariableInstanceGetNamesScript"
+	);
+
+	TRoutine arrayLengthScript;
+	GetFunctionByName("array_length", arrayLengthScript);
+	Hook(
+		(void*)&ArrayLengthDetour,
+		(void*)(arrayLengthScript),
+		(void**)&origArrayLengthScript,
+		"ArrayLengthScript"
 	);
 
 	TRoutine globalScript;

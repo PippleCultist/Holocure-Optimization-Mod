@@ -70,15 +70,19 @@ void Hook(void* NewFunc, void* TargetFuncPointer, void** pfnOriginal, const char
 	}
 };
 
-void HookScriptFunction(const char* scriptFunctionName, void* detourFunction, void** origScript)
+inline int getAssetIndexFromName(const char* name)
 {
 	RValue Result;
 	RValue arg{};
 	arg.Kind = VALUE_STRING;
-	arg.String = RefString::Alloc(scriptFunctionName, strlen(scriptFunctionName));
+	arg.String = RefString::Alloc(name, strlen(name));
 	assetGetIndexFunc(&Result, nullptr, nullptr, 1, &arg);
+	return static_cast<int>(Result.Real);
+}
 
-	int scriptFunctionIndex = static_cast<int>(Result.Real) - 100000;
+void HookScriptFunction(const char* scriptFunctionName, void* detourFunction, void** origScript)
+{
+	int scriptFunctionIndex = getAssetIndexFromName(scriptFunctionName) - 100000;
 
 	CScript* CScript = scriptList(scriptFunctionIndex);
 
@@ -234,7 +238,7 @@ static YYRValue tempRet(true);
 
 struct testStruct
 {
-	testStruct(): Self(nullptr), Other(nullptr), ReturnValue(nullptr), numArgs(0), Args(nullptr)
+	testStruct() : Self(nullptr), Other(nullptr), ReturnValue(nullptr), numArgs(0), Args(nullptr)
 	{
 	}
 
@@ -255,19 +259,30 @@ static int curFuncParamDepth = 0;
 
 typedef YYRValue* (*ScriptFunc)(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args);
 
+using setFuncParamFunctionPtr = void (*)(RValue* paramArr, YYRValue** Args, CInstance* Self);
+using initializeVariablesFunctionPtr = void (*)(CInstance* Self);
 
-YYRValue* RunStructFunctions(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args, auto& setFuncParams, int numParams, int structIndex, int returnArgIndex)
+RValue* invincibleRef = nullptr;
+
+YYRValue* RunStructFunctions(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args, setFuncParamFunctionPtr setFuncParams, initializeVariablesFunctionPtr initializeVariables, int numParams, int structIndex, int returnArgIndex, bool& isFastExit)
 {
 	int StructHash = baseMobVarIndexMap[structIndex];
 	RValue* StructRef = nullptr;
+
 	Self->m_yyvarsMap->FindElement(StructHash, StructRef);
 	YYObjectBase* Struct = StructRef->Object;
 
-	if (!(Struct->m_yyvarsMap) || Struct->m_yyvarsMap->m_numUsed == 0)
+	if (Struct->m_yyvarsMap == nullptr || Struct->m_yyvarsMap->m_numUsed == 0)
 	{
 		ReturnValue->Kind = Args[returnArgIndex]->Kind;
 		ReturnValue->Real = Args[returnArgIndex]->Real;
+		isFastExit = true;
 		return Args[returnArgIndex];
+	}
+
+	if (initializeVariables != nullptr)
+	{
+		initializeVariables(Self);
 	}
 
 	int baseMobArrHash = baseMobVarIndexMap[1000];
@@ -305,24 +320,21 @@ YYRValue* RunStructFunctions(CInstance* Self, CInstance* Other, YYRValue* Return
 	baseMobArrRef->RefArray->length = prevRefArrLength;
 	curFuncParamDepth--;
 
+	isFastExit = false;
 	ReturnValue->Kind = Args[returnArgIndex]->Kind;
 	ReturnValue->Real = Args[returnArgIndex]->Real;
 	return Args[returnArgIndex];
 }
 
 ScriptFunc origOnTakeDamageScript = nullptr;
-static long long onTakeDamageFuncTime = 0;
-static int onTakeDamageNumTimes = 0;
+static long long onTakeDamageFastFuncTime = 0;
+static int onTakeDamageFastNumTimes = 0;
+static long long onTakeDamageSlowFuncTime = 0;
+static int onTakeDamageSlowNumTimes = 0;
 
 YYRValue* OnTakeDamageFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
-	auto start = std::chrono::high_resolution_clock::now();
-
-	int invincibleHash = baseMobVarIndexMap[6];
-	RValue* invincibleRef = nullptr;
-	Self->m_yyvarsMap->FindElement(invincibleHash, invincibleRef);
-
-	auto setFuncParams = [invincibleRef](RValue* paramArr, YYRValue** Args, CInstance* Self) {
+	auto setFuncParams = [](RValue* paramArr, YYRValue** Args, CInstance* Self) {
 		paramArr[0] = *(Args[0]);
 		paramArr[1] = *(Args[1]);
 		paramArr[2] = *(Args[2]);
@@ -332,15 +344,27 @@ YYRValue* OnTakeDamageFuncDetour(CInstance* Self, CInstance* Other, YYRValue* Re
 		paramArr[5] = *(Args[3]);
 	};
 
+	auto initializeVariables = [](CInstance* Self) {
+		int invincibleHash = baseMobVarIndexMap[6];
+		Self->m_yyvarsMap->FindElement(invincibleHash, invincibleRef);
+	};
+
 	int numParams = 6;
 	int structIndex = 3;
 	int returnArgIndex = 0;
+	bool isFastExit = false;
 
-	RunStructFunctions(Self, Other, ReturnValue, numArgs, Args, setFuncParams, numParams, structIndex, returnArgIndex);
+	RunStructFunctions(Self, Other, ReturnValue, numArgs, Args, setFuncParams, initializeVariables, numParams, structIndex, returnArgIndex, isFastExit);
 
-	auto end = std::chrono::high_resolution_clock::now();
-	onTakeDamageFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-	onTakeDamageNumTimes++;
+	if (isFastExit)
+	{
+		onTakeDamageFastNumTimes++;
+	}
+	else
+	{
+		onTakeDamageSlowNumTimes++;
+	}
+
 	return Args[0];
 };
 
@@ -355,7 +379,6 @@ static CInstance* curHitTargetAttackInstance = nullptr;
 
 YYRValue* ApplyOnHitEffectsFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
-	auto start = std::chrono::high_resolution_clock::now();
 	if (Args[1]->Kind == VALUE_UNDEFINED)
 	{
 		ReturnValue->Kind = Args[0]->Kind;
@@ -367,16 +390,13 @@ YYRValue* ApplyOnHitEffectsFuncDetour(CInstance* Self, CInstance* Other, YYRValu
 		Args[3]->Kind = VALUE_REAL;
 		Args[3]->Real = 0;
 	}
-	
+
 	// find a way to get meaningful information out of object instance id instead of not handling it
 	if (curHitTargetAttackInstance == nullptr)
 	{
-		ReturnValue->Kind = Args[0]->Kind;
-		ReturnValue->Real = Args[0]->Real;
-		auto end = std::chrono::high_resolution_clock::now();
-		applyOnHitEffectsFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-		applyOnHitEffectsNumTimes++;
-		return Args[0];
+		YYRValue* Res = origApplyOnHitEffectsScript(Self, Other, ReturnValue, numArgs, Args);
+		applyOnHitEffectsSlowNumTimes++;
+		return Res;
 	}
 
 	RValue* isEnemyPtr = nullptr;
@@ -388,7 +408,7 @@ YYRValue* ApplyOnHitEffectsFuncDetour(CInstance* Self, CInstance* Other, YYRValu
 	RValue* onHitEffectsPtr = nullptr;
 	int onHitEffectsHash = attackIndexMap[3];
 	curHitTargetAttackInstance->m_yyvarsMap->FindElement(onHitEffectsHash, onHitEffectsPtr);
-	
+
 	RValue* creatorOnHitEffectsPtr = nullptr;
 	if (isEnemyPtr == nullptr || (creatorPtr != nullptr && isEnemyPtr->Real != 0))
 	{
@@ -399,8 +419,6 @@ YYRValue* ApplyOnHitEffectsFuncDetour(CInstance* Self, CInstance* Other, YYRValu
 	{
 		ReturnValue->Kind = Args[0]->Kind;
 		ReturnValue->Real = Args[0]->Real;
-		auto end = std::chrono::high_resolution_clock::now();
-		applyOnHitEffectsFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 		applyOnHitEffectsNumTimes++;
 		return Args[0];
 	}
@@ -449,8 +467,6 @@ YYRValue* ApplyOnHitEffectsFuncDetour(CInstance* Self, CInstance* Other, YYRValu
 	if (!hasAllHashes)
 	{
 		YYRValue* Res = origApplyOnHitEffectsScript(Self, Other, ReturnValue, numArgs, Args);
-		auto end = std::chrono::high_resolution_clock::now();
-		applyOnHitEffectsSlowFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 		applyOnHitEffectsSlowNumTimes++;
 		return Res;
 	}
@@ -504,8 +520,6 @@ YYRValue* ApplyOnHitEffectsFuncDetour(CInstance* Self, CInstance* Other, YYRValu
 	ReturnValue->Kind = Args[0]->Kind;
 	ReturnValue->Real = Args[0]->Real;
 
-	auto end = std::chrono::high_resolution_clock::now();
-	applyOnHitEffectsFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 	applyOnHitEffectsNumTimes++;
 	return Args[0];
 };
@@ -527,46 +541,137 @@ void DSMapSetDetour(RValue* Result, CInstance* Self, CInstance* Other, int numAr
 }
 
 ScriptFunc origApplyKnockbackScript = nullptr;
-static long long applyKnockbackFuncTime = 0;
-static int applyKnockbackNumTimes = 0;
+static long long applyKnockbackFastFuncTime = 0;
+static int applyKnockbackFastNumTimes = 0;
+static long long applyKnockbackSlowFuncTime = 0;
+static int applyKnockbackSlowNumTimes = 0;
 
 YYRValue* ApplyKnockbackFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
-	auto start = std::chrono::high_resolution_clock::now();
+	// find a way to get meaningful information out of object instance id instead of not handling it
+	if (curHitTargetAttackInstance == nullptr)
+	{
+		YYRValue* Res = origApplyKnockbackScript(Self, Other, ReturnValue, numArgs, Args);
+		applyKnockbackSlowNumTimes++;
+		return Res;
+	}
+
+	RValue* knockbackPtr = nullptr;
+	int knockbackHash = attackIndexMap[5];
+	curHitTargetAttackInstance->m_yyvarsMap->FindElement(knockbackHash, knockbackPtr);
+
+	if (knockbackPtr == nullptr || knockbackPtr->Object->m_yyvarsMap == nullptr)
+	{
+		applyKnockbackFastNumTimes++;
+		return nullptr;
+	}
+
+	RValue* durationPtr = nullptr;
+	int durationHash = attackIndexMap[6];
+	knockbackPtr->Object->m_yyvarsMap->FindElement(durationHash, durationPtr);
+
+	if (durationPtr == nullptr)
+	{
+		applyKnockbackFastNumTimes++;
+		return nullptr;
+	}
+
+	RValue* isKnockbackPtr = nullptr;
+	int isKnockbackHash = attackIndexMap[7];
+	Self->m_yyvarsMap->FindElement(isKnockbackHash, isKnockbackPtr);
+	RValue* isKnockbackDurationPtr = nullptr;
+	isKnockbackPtr->Object->m_yyvarsMap->FindElement(durationHash, isKnockbackDurationPtr);
+	if (isKnockbackDurationPtr == nullptr || isKnockbackDurationPtr->Real != 0)
+	{
+		applyKnockbackFastNumTimes++;
+		return nullptr;
+	}
+
+	RValue* knockbackImmunePtr = nullptr;
+	int knockbackImmuneHash = attackIndexMap[8];
+	Self->m_yyvarsMap->FindElement(knockbackImmuneHash, knockbackImmunePtr);
+	if (knockbackImmunePtr == nullptr || knockbackImmunePtr->Real != 0)
+	{
+		applyKnockbackFastNumTimes++;
+		return nullptr;
+	}
+
 	YYRValue* res = origApplyKnockbackScript(Self, Other, ReturnValue, numArgs, Args);
-	auto end = std::chrono::high_resolution_clock::now();
-	applyKnockbackFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-	applyKnockbackNumTimes++;
+	applyKnockbackSlowNumTimes++;
 	return res;
 };
 
 ScriptFunc origApplyStatusEffectsScript = nullptr;
-static long long applyStatusEffectsFuncTime = 0;
-static int applyStatusEffectsNumTimes = 0;
+static long long applyStatusEffectsFastFuncTime = 0;
+static int applyStatusEffectsFastNumTimes = 0;
+static long long applyStatusEffectsSlowFuncTime = 0;
+static int applyStatusEffectsSlowNumTimes = 0;
 
 YYRValue* ApplyStatusEffectsFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
-	auto start = std::chrono::high_resolution_clock::now();
+	// find a way to get meaningful information out of object instance id instead of not handling it
+	if (curHitTargetAttackInstance == nullptr)
+	{
+		YYRValue* Res = origApplyStatusEffectsScript(Self, Other, ReturnValue, numArgs, Args);
+		applyStatusEffectsSlowNumTimes++;
+		return Res;
+	}
+
+	RValue* isEnemyPtr = nullptr;
+	int isEnemyHash = attackIndexMap[0];
+	curHitTargetAttackInstance->m_yyvarsMap->FindElement(isEnemyHash, isEnemyPtr);
+
+	int statusEffectsLength = 0;
+	if (isEnemyPtr == nullptr)
+	{
+		RValue* creatorPtr = nullptr;
+		int creatorHash = attackIndexMap[1];
+		curHitTargetAttackInstance->m_yyvarsMap->FindElement(creatorHash, creatorPtr);
+		RValue* creatorStatusEffects = nullptr;
+		int statusEffectsHash = attackIndexMap[4];
+		creatorPtr->Object->m_yyvarsMap->FindElement(statusEffectsHash, creatorStatusEffects);
+		RValue* statusEffects = nullptr;
+		curHitTargetAttackInstance->m_yyvarsMap->FindElement(statusEffectsHash, statusEffects);
+		if (creatorStatusEffects->Object->m_yyvarsMap != nullptr)
+		{
+			statusEffectsLength += creatorStatusEffects->Object->m_yyvarsMap->m_numUsed;
+		}
+		if (statusEffects->Object->m_yyvarsMap != nullptr)
+		{
+			statusEffectsLength += statusEffects->Object->m_yyvarsMap->m_numUsed;
+		}
+	}
+	else
+	{
+		RValue* statusEffects = nullptr;
+		int statusEffectsHash = attackIndexMap[4];
+		curHitTargetAttackInstance->m_yyvarsMap->FindElement(statusEffectsHash, statusEffects);
+		if (statusEffects->Object->m_yyvarsMap != nullptr)
+		{
+			statusEffectsLength += statusEffects->Object->m_yyvarsMap->m_numUsed;
+		}
+	}
+
+	if (statusEffectsLength == 0)
+	{
+		applyStatusEffectsFastNumTimes++;
+		return Args[0];
+	}
+
 	YYRValue* res = origApplyStatusEffectsScript(Self, Other, ReturnValue, numArgs, Args);
-	auto end = std::chrono::high_resolution_clock::now();
-	applyStatusEffectsFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-	applyStatusEffectsNumTimes++;
+	applyStatusEffectsSlowNumTimes++;
 	return res;
 };
 
 ScriptFunc origOnTakeDamageAfterScript = nullptr;
-static long long onTakeDamageAfterFuncTime = 0;
-static int onTakeDamageAfterNumTimes = 0;
+static long long onTakeDamageAfterFastFuncTime = 0;
+static int onTakeDamageAfterFastNumTimes = 0;
+static long long onTakeDamageAfterSlowFuncTime = 0;
+static int onTakeDamageAfterSlowNumTimes = 0;
 
 YYRValue* OnTakeDamageAfterFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
-	auto start = std::chrono::high_resolution_clock::now();
-
-	int invincibleHash = baseMobVarIndexMap[6];
-	RValue* invincibleRef = nullptr;
-	Self->m_yyvarsMap->FindElement(invincibleHash, invincibleRef);
-
-	auto setFuncParams = [invincibleRef](RValue* paramArr, YYRValue** Args, CInstance* Self) {
+	auto setFuncParams = [](RValue* paramArr, YYRValue** Args, CInstance* Self) {
 		paramArr[0] = *(Args[0]);
 		paramArr[1] = *(Args[1]);
 		paramArr[2] = *(Args[2]);
@@ -576,26 +681,37 @@ YYRValue* OnTakeDamageAfterFuncDetour(CInstance* Self, CInstance* Other, YYRValu
 		paramArr[5] = *(Args[3]);
 	};
 
+	auto initializeVariables = [](CInstance* Self) {
+		int invincibleHash = baseMobVarIndexMap[6];
+		Self->m_yyvarsMap->FindElement(invincibleHash, invincibleRef);
+	};
+
 	int numParams = 6;
 	int structIndex = 4;
 	int returnArgIndex = 0;
+	bool isFastExit = false;
 
-	RunStructFunctions(Self, Other, ReturnValue, numArgs, Args, setFuncParams, numParams, structIndex, returnArgIndex);
-	
-	auto end = std::chrono::high_resolution_clock::now();
-	onTakeDamageAfterFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-	onTakeDamageAfterNumTimes++;
+	RunStructFunctions(Self, Other, ReturnValue, numArgs, Args, setFuncParams, initializeVariables, numParams, structIndex, returnArgIndex, isFastExit);
+
+	if (isFastExit)
+	{
+		onTakeDamageAfterFastNumTimes++;
+	}
+	else
+	{
+		onTakeDamageAfterSlowNumTimes++;
+	}
 	return Args[0];
 };
 
 ScriptFunc origOnDodgeScript = nullptr;
-static long long onDodgeFuncTime = 0;
-static int onDodgeNumTimes = 0;
+static long long onDodgeFastFuncTime = 0;
+static int onDodgeFastNumTimes = 0;
+static long long onDodgeSlowFuncTime = 0;
+static int onDodgeSlowNumTimes = 0;
 
 YYRValue* OnDodgeFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
-	auto start = std::chrono::high_resolution_clock::now();
-
 	auto setFuncParams = [](RValue* paramArr, YYRValue** Args, CInstance* Self) {
 		paramArr[0] = *(Args[0]);
 		paramArr[1] = *(Args[1]);
@@ -607,12 +723,19 @@ YYRValue* OnDodgeFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnV
 	int numParams = 4;
 	int structIndex = 5;
 	int returnArgIndex = 0;
+	bool isFastExit = false;
 
-	RunStructFunctions(Self, Other, ReturnValue, numArgs, Args, setFuncParams, numParams, structIndex, returnArgIndex);
+	RunStructFunctions(Self, Other, ReturnValue, numArgs, Args, setFuncParams, nullptr, numParams, structIndex, returnArgIndex, isFastExit);
 
-	auto end = std::chrono::high_resolution_clock::now();
-	onDodgeFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-	onDodgeNumTimes++;
+	if (isFastExit)
+	{
+		onDodgeFastNumTimes++;
+	}
+	else
+	{
+		onDodgeSlowNumTimes++;
+	}
+
 	return Args[0];
 };
 
@@ -637,14 +760,39 @@ YYRValue* ApplyDamageFuncDetour(CInstance* Self, CInstance* Other, YYRValue* Ret
 ScriptFunc origHitNumberScript = nullptr;
 static long long hitNumberFuncTime = 0;
 static int hitNumberNumTimes = 0;
+static int objDamageTextIndex = -1;;
+
+static int numDamageText = 0;
 
 YYRValue* HitNumberFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
 	auto start = std::chrono::high_resolution_clock::now();
+	RValue* showDamageTextPtr = nullptr;
+	int showDamageTextHash = attackIndexMap[9];
+	globalInstancePtr->m_yyvarsMap->FindElement(showDamageTextHash, showDamageTextPtr);
+	if (showDamageTextPtr->Real == 0)
+	{
+		auto end = std::chrono::high_resolution_clock::now();
+		hitNumberFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+		hitNumberNumTimes++;
+		return nullptr;
+	}
+
+	if (numDamageText >= 100)
+	{
+		auto end = std::chrono::high_resolution_clock::now();
+		hitNumberFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+		hitNumberNumTimes++;
+		return nullptr;
+	}
+
+	bool prevIsInApplyDamageFunc = isInApplyDamageFunc;
+	isInApplyDamageFunc = false;
 	YYRValue* res = origHitNumberScript(Self, Other, ReturnValue, numArgs, Args);
 	auto end = std::chrono::high_resolution_clock::now();
 	hitNumberFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 	hitNumberNumTimes++;
+	isInApplyDamageFunc = prevIsInApplyDamageFunc;
 	return res;
 };
 
@@ -654,11 +802,14 @@ static int onKillingHitNumTimes = 0;
 
 YYRValue* OnKillingHitFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
+	bool prevIsInApplyDamageFunc = isInApplyDamageFunc;
+	isInApplyDamageFunc = false;
 	auto start = std::chrono::high_resolution_clock::now();
 	YYRValue* res = origOnKillingHitScript(Self, Other, ReturnValue, numArgs, Args);
 	auto end = std::chrono::high_resolution_clock::now();
 	onKillingHitFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 	onKillingHitNumTimes++;
+	isInApplyDamageFunc = prevIsInApplyDamageFunc;
 	return res;
 };
 
@@ -677,11 +828,14 @@ static int soundPlayNumTimes = 0;
 
 YYRValue* SoundPlayFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
+	bool prevIsInApplyDamageFunc = isInApplyDamageFunc;
+	isInApplyDamageFunc = false;
 	auto start = std::chrono::high_resolution_clock::now();
 	YYRValue* res = origSoundPlayScript(Self, Other, ReturnValue, numArgs, Args);
 	auto end = std::chrono::high_resolution_clock::now();
 	soundPlayFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 	soundPlayNumTimes++;
+	isInApplyDamageFunc = prevIsInApplyDamageFunc;
 	return res;
 };
 
@@ -691,11 +845,14 @@ static int applyHitEffectNumTimes = 0;
 
 YYRValue* ApplyHitEffectFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
+	bool prevIsInApplyDamageFunc = isInApplyDamageFunc;
+	isInApplyDamageFunc = false;
 	auto start = std::chrono::high_resolution_clock::now();
 	YYRValue* res = origApplyHitEffectScript(Self, Other, ReturnValue, numArgs, Args);
 	auto end = std::chrono::high_resolution_clock::now();
 	applyHitEffectFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 	applyHitEffectNumTimes++;
+	isInApplyDamageFunc = prevIsInApplyDamageFunc;
 	return res;
 };
 
@@ -707,6 +864,8 @@ static bool isInDieFunc = false;
 
 YYRValue* DieFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
+	bool prevIsInApplyDamageFunc = isInApplyDamageFunc;
+	isInApplyDamageFunc = false;
 	isInDieFunc = true;
 	auto start = std::chrono::high_resolution_clock::now();
 	YYRValue* res = origDieScript(Self, Other, ReturnValue, numArgs, Args);
@@ -714,6 +873,7 @@ YYRValue* DieFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue
 	dieFuncTime += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 	dieNumTimes++;
 	isInDieFunc = false;
+	isInApplyDamageFunc = prevIsInApplyDamageFunc;
 	return res;
 };
 
@@ -722,6 +882,7 @@ static long long takeDamageFuncTime = 0;
 static int takeDamageNumTimes = 0;
 
 std::chrono::steady_clock::time_point takeDamageStartTime;
+YYRValue* takeDamageFuncArgs[9];
 
 YYRValue* TakeDamageFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
@@ -734,9 +895,28 @@ YYRValue* TakeDamageFuncDetour(CInstance* Self, CInstance* Other, YYRValue* Retu
 	isInHitTarget = false;
 	auto start = std::chrono::high_resolution_clock::now();
 	YYRValue* res = nullptr;
-//	for (int i = 0; i < 10000; i++)
+	if (numArgs < 9)
 	{
-		res = origTakeDamageScript(Self, Other, ReturnValue, numArgs, Args);
+		for (int i = 0; i < 9; i++)
+		{
+			if (takeDamageFuncArgs[i] == nullptr)
+			{
+				takeDamageFuncArgs[i] = new YYRValue();
+			}
+			if (i < numArgs)
+			{
+				memcpy(takeDamageFuncArgs[i], Args[i], sizeof(YYRValue));
+			}
+			else
+			{
+				takeDamageFuncArgs[i]->Kind = VALUE_UNDEFINED;
+			}
+		}
+		Args = takeDamageFuncArgs;
+	}
+	//	for (int i = 0; i < 10000; i++)
+	{
+		res = origTakeDamageScript(Self, Other, ReturnValue, 9, Args);
 	}
 	auto end = std::chrono::high_resolution_clock::now();
 	takeDamageFuncTime += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
@@ -781,7 +961,7 @@ YYRValue* CalculateDamageFuncDetour(CInstance* Self, CInstance* Other, YYRValue*
 	isInCalculateDamage = true;
 	auto start = std::chrono::high_resolution_clock::now();
 	YYRValue* res = nullptr;
-//	for (int i = 0; i < 10000; i++)
+	//	for (int i = 0; i < 10000; i++)
 	{
 		res = origCalculateDamageScript(Self, Other, ReturnValue, numArgs, Args);
 	}
@@ -809,7 +989,7 @@ YYRValue* HitTargetFuncDetour(CInstance* Self, CInstance* Other, YYRValue* Retur
 	isInHitTarget = true;
 	auto start = std::chrono::high_resolution_clock::now();
 	YYRValue* res = nullptr;
-//	for (int i = 0; i < 100000; i++)
+	//	for (int i = 0; i < 100000; i++)
 	{
 		res = origHitTargetScript(Self, Other, ReturnValue, numArgs, Args);
 	}
@@ -859,7 +1039,6 @@ void VariableStructExistsDetour(RValue* Result, CInstance* Self, CInstance* Othe
 		}
 		return;
 	}
-	auto start = std::chrono::high_resolution_clock::now();
 	//For some reason, the second argument can be a real number
 	if (Args[0].Kind == VALUE_OBJECT && Args[1].Kind == VALUE_STRING)
 	{
@@ -867,7 +1046,7 @@ void VariableStructExistsDetour(RValue* Result, CInstance* Self, CInstance* Othe
 		int curHash = 0;
 
 		auto curElementIt = stringHashMap.find(fastHash);
-		
+
 		if (curElementIt == stringHashMap.end())
 		{
 			RValue Res;
@@ -879,7 +1058,7 @@ void VariableStructExistsDetour(RValue* Result, CInstance* Self, CInstance* Othe
 		{
 			curHash = curElementIt->second;
 		}
-		
+
 		Result->Kind = VALUE_REAL;
 		auto curMap = Args[0].Object->m_yyvarsMap;
 		RValue* curElement = nullptr;
@@ -891,16 +1070,12 @@ void VariableStructExistsDetour(RValue* Result, CInstance* Self, CInstance* Othe
 		{
 			Result->Real = 1;
 		}
-		auto end = std::chrono::high_resolution_clock::now();
-		VariableStructExistsFastFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 		VariableStructExistsFastNumTimes++;
 		return;
 	}
 
 	//Need to find a way to also get the optimization working for references
 	origVariableStructExistsScript(Result, Self, Other, numArgs, Args);
-	auto end = std::chrono::high_resolution_clock::now();
-	VariableStructExistsSlowFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 	VariableStructExistsSlowNumTimes++;
 }
 
@@ -941,16 +1116,44 @@ void ArrayLengthDetour(RValue* Result, CInstance* Self, CInstance* Other, int nu
 	origArrayLengthScript(Result, Self, Other, numArgs, Args);
 }
 
+TRoutine origInstanceCreateDepthScript = nullptr;
+void InstanceCreateDepthDetour(RValue* Result, CInstance* Self, CInstance* Other, int numArgs, RValue* Args)
+{
+	if (static_cast<int>(Args[3].Real) == objDamageTextIndex)
+	{
+		numDamageText++;
+	}
+	origInstanceCreateDepthScript(Result, Self, Other, numArgs, Args);
+}
+
+TRoutine origShowDebugMessageScript = nullptr;
+void ShowDebugMessageDetour(RValue* Result, CInstance* Self, CInstance* Other, int numArgs, RValue* Args)
+{
+	return;
+}
+
+TRoutine origInstanceExistsScript = nullptr;
+void InstanceExistsDetour(RValue* Result, CInstance* Self, CInstance* Other, int numArgs, RValue* Args)
+{
+	if (isInApplyDamageFunc && Args[0].Kind == VALUE_REF)
+	{
+		Result->Kind = VALUE_BOOL;
+		Result->Real = 0;
+		return;
+	}
+	origInstanceExistsScript(Result, Self, Other, numArgs, Args);
+}
+
 ScriptFunc origOnCriticalHitScript = nullptr;
-static long long onCriticalHitFuncTime = 0;
-static int onCriticalHitNumTimes = 0;
+static long long onCriticalHitFastFuncTime = 0;
+static int onCriticalHitFastNumTimes = 0;
+static long long onCriticalHitSlowFuncTime = 0;
+static int onCriticalHitSlowNumTimes = 0;
 
 static RValue funcParamArr;
 
 YYRValue* OnCriticalHitFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
-	auto start = std::chrono::high_resolution_clock::now();
-
 	auto setFuncParams = [](RValue* paramArr, YYRValue** Args, CInstance* Self) {
 		paramArr[0].Kind = VALUE_OBJECT;
 		paramArr[0].Instance = Self;
@@ -962,25 +1165,30 @@ YYRValue* OnCriticalHitFuncDetour(CInstance* Self, CInstance* Other, YYRValue* R
 	int numParams = 4;
 	int structIndex = 2;
 	int returnArgIndex = 2;
+	bool isFastExit = false;
 
-	RunStructFunctions(Self, Other, ReturnValue, numArgs, Args, setFuncParams, numParams, structIndex, returnArgIndex);
+	RunStructFunctions(Self, Other, ReturnValue, numArgs, Args, setFuncParams, nullptr, numParams, structIndex, returnArgIndex, isFastExit);
 
-	auto end = std::chrono::high_resolution_clock::now();
-	onCriticalHitFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-	onCriticalHitNumTimes++;
+	if (isFastExit)
+	{
+		onCriticalHitFastNumTimes++;
+	}
+	else
+	{
+		onCriticalHitSlowNumTimes++;
+	}
+
 	return Args[2];
 };
 
 ScriptFunc origAfterCriticalHitScript = nullptr;
-static long long afterCriticalHitQuickFuncTime = 0;
-static int afterCriticalHitQuickNumTimes = 0;
+static long long afterCriticalHitFastFuncTime = 0;
+static int afterCriticalHitFastNumTimes = 0;
 static long long afterCriticalHitSlowFuncTime = 0;
 static int afterCriticalHitSlowNumTimes = 0;
 
 YYRValue* AfterCriticalHitFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
-	auto start = std::chrono::high_resolution_clock::now();
-
 	auto setFuncParams = [](RValue* paramArr, YYRValue** Args, CInstance* Self) {
 		paramArr[0].Kind = VALUE_OBJECT;
 		paramArr[0].Instance = Self;
@@ -992,25 +1200,30 @@ YYRValue* AfterCriticalHitFuncDetour(CInstance* Self, CInstance* Other, YYRValue
 	int numParams = 4;
 	int structIndex = 1;
 	int returnArgIndex = 2;
+	bool isFastExit = false;
 
-	RunStructFunctions(Self, Other, ReturnValue, numArgs, Args, setFuncParams, numParams, structIndex, returnArgIndex);
+	RunStructFunctions(Self, Other, ReturnValue, numArgs, Args, setFuncParams, nullptr, numParams, structIndex, returnArgIndex, isFastExit);
 
-	auto end = std::chrono::high_resolution_clock::now();
-	afterCriticalHitSlowFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-	afterCriticalHitSlowNumTimes++;
+	if (isFastExit)
+	{
+		afterCriticalHitFastNumTimes++;
+	}
+	else
+	{
+		afterCriticalHitSlowNumTimes++;
+	}
+
 	return Args[2];
 };
 
 ScriptFunc origBeforeDamageCalculationScript = nullptr;
 static long long beforeDamageCalculationSlowFuncTime = 0;
 static int beforeDamageCalculationSlowNumTimes = 0;
-static long long beforeDamageCalculationQuickFuncTime = 0;
-static int beforeDamageCalculationQuickNumTimes = 0;
+static long long beforeDamageCalculationFastFuncTime = 0;
+static int beforeDamageCalculationFastNumTimes = 0;
 
 YYRValue* BeforeDamageCalculationFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
-	auto start = std::chrono::high_resolution_clock::now();
-
 	auto setFuncParams = [](RValue* paramArr, YYRValue** Args, CInstance* Self) {
 		paramArr[0] = *(Args[0]);
 		paramArr[1] = *(Args[1]);
@@ -1020,12 +1233,19 @@ YYRValue* BeforeDamageCalculationFuncDetour(CInstance* Self, CInstance* Other, Y
 	int numParams = 4;
 	int structIndex = 0;
 	int returnArgIndex = 2;
+	bool isFastExit = false;
 
-	RunStructFunctions(Self, Other, ReturnValue, numArgs, Args, setFuncParams, numParams, structIndex, returnArgIndex);
+	RunStructFunctions(Self, Other, ReturnValue, numArgs, Args, setFuncParams, nullptr, numParams, structIndex, returnArgIndex, isFastExit);
 
-	auto end = std::chrono::high_resolution_clock::now();
-	beforeDamageCalculationSlowFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-	beforeDamageCalculationSlowNumTimes++;
+	if (isFastExit)
+	{
+		beforeDamageCalculationFastNumTimes++;
+	}
+	else
+	{
+		beforeDamageCalculationSlowNumTimes++;
+	}
+
 	return Args[2];
 };
 
@@ -1079,19 +1299,25 @@ YYTKStatus FrameCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 		{
 			outFile << "hitTargetFuncTime: " << hitTargetFuncTime << " num times: " << hitTargetNumTimes << "\n";
 			outFile << "calculateDamageFuncTime: " << calculateDamageFuncTime << " num times: " << calculateDamageNumTimes << "\n";
-			outFile << "beforeDamageCalculationQuickFuncTime: " << beforeDamageCalculationQuickFuncTime << " num times: " << beforeDamageCalculationQuickNumTimes << "\n";
+			outFile << "beforeDamageCalculationFastFuncTime: " << beforeDamageCalculationFastFuncTime << " num times: " << beforeDamageCalculationFastNumTimes << "\n";
 			outFile << "beforeDamageCalculationSlowFuncTime: " << beforeDamageCalculationSlowFuncTime << " num times: " << beforeDamageCalculationSlowNumTimes << "\n";
-			outFile << "onCriticalHitFuncTime: " << onCriticalHitFuncTime << " num times: " << onCriticalHitNumTimes << "\n";
-			outFile << "afterCriticalHitQuickFuncTime: " << afterCriticalHitQuickFuncTime << " num times: " << afterCriticalHitQuickNumTimes << "\n";
+			outFile << "onCriticalHitFastFuncTime: " << onCriticalHitFastFuncTime << " num times: " << onCriticalHitFastNumTimes << "\n";
+			outFile << "onCriticalHitSlowFuncTime: " << onCriticalHitSlowFuncTime << " num times: " << onCriticalHitSlowNumTimes << "\n";
+			outFile << "afterCriticalHitFastFuncTime: " << afterCriticalHitFastFuncTime << " num times: " << afterCriticalHitFastNumTimes << "\n";
 			outFile << "afterCriticalHitSlowFuncTime: " << afterCriticalHitSlowFuncTime << " num times: " << afterCriticalHitSlowNumTimes << "\n";
 			outFile << "takeDamageFuncTime: " << takeDamageFuncTime << " num times: " << takeDamageNumTimes << "\n";
-			outFile << "onTakeDamage func time: " << onTakeDamageFuncTime << " num times: " << onTakeDamageNumTimes << "\n";
+			outFile << "onTakeDamageFastFuncTime func time: " << onTakeDamageFastFuncTime << " num times: " << onTakeDamageFastNumTimes << "\n";
+			outFile << "onTakeDamageSlowFuncTime func time: " << onTakeDamageSlowFuncTime << " num times: " << onTakeDamageSlowNumTimes << "\n";
 			outFile << "applyOnHitEffectsFuncTime: " << applyOnHitEffectsFuncTime << " num times: " << applyOnHitEffectsNumTimes << "\n";
 			outFile << "applyOnHitEffectsSlowFuncTime: " << applyOnHitEffectsSlowFuncTime << " num times: " << applyOnHitEffectsSlowNumTimes << "\n";
-			outFile << "applyKnockbackFuncTime: " << applyKnockbackFuncTime << " num times: " << applyKnockbackNumTimes << "\n";
-			outFile << "applyStatusEffectsFuncTime: " << applyStatusEffectsFuncTime << " num times: " << applyStatusEffectsNumTimes << "\n";
-			outFile << "onTakeDamageAfterFuncTime: " << onTakeDamageAfterFuncTime << " num times: " << onTakeDamageAfterNumTimes << "\n";
-			outFile << "onDodgeFuncTime: " << onDodgeFuncTime << " num times: " << onDodgeNumTimes << "\n";
+			outFile << "applyKnockbackFastFuncTime: " << applyKnockbackFastFuncTime << " num times: " << applyKnockbackFastNumTimes << "\n";
+			outFile << "applyKnockbackSlowFuncTime: " << applyKnockbackSlowFuncTime << " num times: " << applyKnockbackSlowNumTimes << "\n";
+			outFile << "applyStatusEffectsFastFuncTime: " << applyStatusEffectsFastFuncTime << " num times: " << applyStatusEffectsFastNumTimes << "\n";
+			outFile << "applyStatusEffectsSlowFuncTime: " << applyStatusEffectsSlowFuncTime << " num times: " << applyStatusEffectsSlowNumTimes << "\n";
+			outFile << "onTakeDamageAfterFastFuncTime: " << onTakeDamageAfterFastFuncTime << " num times: " << onTakeDamageAfterFastNumTimes << "\n";
+			outFile << "onTakeDamageAfterSlowFuncTime: " << onTakeDamageAfterSlowFuncTime << " num times: " << onTakeDamageAfterSlowNumTimes << "\n";
+			outFile << "onDodgeFastFuncTime: " << onDodgeFastFuncTime << " num times: " << onDodgeFastNumTimes << "\n";
+			outFile << "onDodgeSlowFuncTime: " << onDodgeSlowFuncTime << " num times: " << onDodgeSlowNumTimes << "\n";
 			outFile << "applyDamageFuncTime: " << applyDamageFuncTime << " num times: " << applyDamageNumTimes << "\n";
 			outFile << "hitNumberFuncTime: " << hitNumberFuncTime << " num times: " << hitNumberNumTimes << "\n";
 			outFile << "onKillingHitFuncTime: " << onKillingHitFuncTime << " num times: " << onKillingHitNumTimes << "\n";
@@ -1119,20 +1345,30 @@ YYTKStatus FrameCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 	{
 		YYRValue ret;
 		PrintMessage(CLR_DEFAULT, "%d %d %d %d %d", it.Self, it.Other, it.ReturnValue, it.numArgs, it.Args);
-//		origTestFunc(it.Self, it.Other, &ret, 1, it.Args);
+		//		origTestFunc(it.Self, it.Other, &ret, 1, it.Args);
 	}
-	onTakeDamageNumTimes = 0;
-	onTakeDamageFuncTime = 0;
+	onTakeDamageFastNumTimes = 0;
+	onTakeDamageFastFuncTime = 0;
+	onTakeDamageSlowNumTimes = 0;
+	onTakeDamageSlowFuncTime = 0;
 	applyOnHitEffectsFuncTime = 0;
 	applyOnHitEffectsNumTimes = 0;
-	applyKnockbackFuncTime = 0;
-	applyKnockbackNumTimes = 0;
-	applyStatusEffectsFuncTime = 0;
-	applyStatusEffectsNumTimes = 0;
-	onTakeDamageAfterFuncTime = 0;
-	onTakeDamageAfterNumTimes = 0;
-	onDodgeFuncTime = 0;
-	onDodgeNumTimes = 0;
+	applyKnockbackFastFuncTime = 0;
+	applyKnockbackFastNumTimes = 0;
+	applyKnockbackSlowFuncTime = 0;
+	applyKnockbackSlowNumTimes = 0;
+	applyStatusEffectsFastFuncTime = 0;
+	applyStatusEffectsFastNumTimes = 0;
+	applyStatusEffectsSlowFuncTime = 0;
+	applyStatusEffectsSlowNumTimes = 0;
+	onTakeDamageAfterFastFuncTime = 0;
+	onTakeDamageAfterFastNumTimes = 0;
+	onTakeDamageAfterSlowFuncTime = 0;
+	onTakeDamageAfterSlowNumTimes = 0;
+	onDodgeFastFuncTime = 0;
+	onDodgeFastNumTimes = 0;
+	onDodgeSlowFuncTime = 0;
+	onDodgeSlowNumTimes = 0;
 	applyDamageFuncTime = 0;
 	applyDamageNumTimes = 0;
 	hitNumberFuncTime = 0;
@@ -1153,16 +1389,18 @@ YYTKStatus FrameCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 	calculateDamageNumTimes = 0;
 	hitTargetFuncTime = 0;
 	hitTargetNumTimes = 0;
-	onCriticalHitFuncTime = 0;
-	onCriticalHitNumTimes = 0;
-	afterCriticalHitQuickFuncTime = 0;
-	afterCriticalHitQuickNumTimes = 0;
+	onCriticalHitFastFuncTime = 0;
+	onCriticalHitFastNumTimes = 0;
+	onCriticalHitSlowFuncTime = 0;
+	onCriticalHitSlowNumTimes = 0;
+	afterCriticalHitFastFuncTime = 0;
+	afterCriticalHitFastNumTimes = 0;
 	afterCriticalHitSlowFuncTime = 0;
 	afterCriticalHitSlowNumTimes = 0;
 	dropEXPFuncTime = 0;
 	dropEXPNumTimes = 0;
-	beforeDamageCalculationQuickFuncTime = 0;
-	beforeDamageCalculationQuickNumTimes = 0;
+	beforeDamageCalculationFastFuncTime = 0;
+	beforeDamageCalculationFastNumTimes = 0;
 	beforeDamageCalculationSlowFuncTime = 0;
 	beforeDamageCalculationSlowNumTimes = 0;
 	applyOnHitEffectsSlowFuncTime = 0;
@@ -1270,7 +1508,6 @@ YYTKStatus CodeCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 					YYRValue Result;
 					CallBuiltin(Result, "variable_instance_get", Self, Other, { (long long)Self->i_id, "pickupRange" });
 					currentPlayer.pickupRange = static_cast<int>(Result);
-					PrintMessage(CLR_DEFAULT, "New pickup range: %d", currentPlayer.pickupRange);
 					PickupRangePotentialUpdate = false;
 				}
 				currentPlayer.gmlInstance.ID = Self->i_id;
@@ -1648,6 +1885,21 @@ YYTKStatus CodeCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 			Attack_Destroy_0(pCodeEvent, Self, Other, Code, Res, Flags);
 			codeFuncTable[Code->i_CodeIndex] = Attack_Destroy_0;
 		}
+		else if (_strcmpi(Code->i_pName, "gml_Object_obj_damageText_Alarm_0") == 0)
+		{
+			auto damageText_Alarm_0 = [](YYTKCodeEvent* pCodeEvent, CInstance* Self, CInstance* Other, CCode* Code, RValue* Res, int Flags) {
+				pCodeEvent->Call(Self, Other, Code, Res, Flags);
+				RValue* durationPtr = nullptr;
+				int durationHash = attackIndexMap[10];
+				Self->m_yyvarsMap->FindElement(durationHash, durationPtr);
+				if (durationPtr->Real <= -2)
+				{
+					numDamageText--;
+				}
+			};
+			damageText_Alarm_0(pCodeEvent, Self, Other, Code, Res, Flags);
+			codeFuncTable[Code->i_CodeIndex] = damageText_Alarm_0;
+		}
 		else // Not using this code function, so just quickly ignore it when it's called next time
 		{
 			auto UnmodifiedFunc = [](YYTKCodeEvent* pCodeEvent, CInstance* Self, CInstance* Other, CCode* Code, RValue* Res, int Flags) {
@@ -1787,6 +2039,24 @@ DllExport YYTKStatus PluginEntry(YYTKPlugin* PluginObject)
 		"ArrayLengthScript"
 	);
 
+	TRoutine showDebugMessageScript;
+	GetFunctionByName("show_debug_message", showDebugMessageScript);
+	Hook(
+		(void*)&ShowDebugMessageDetour,
+		(void*)(showDebugMessageScript),
+		(void**)&origShowDebugMessageScript,
+		"ShowDebugMessageScript"
+	);
+
+	TRoutine instanceCreateDepthScript;
+	GetFunctionByName("instance_create_depth", instanceCreateDepthScript);
+	Hook(
+		(void*)&InstanceCreateDepthDetour,
+		(void*)(instanceCreateDepthScript),
+		(void**)&origInstanceCreateDepthScript,
+		"InstanceCreateDepthScript"
+	);
+
 	TRoutine globalScript;
 	GetFunctionByName("@@GlobalScope@@", globalScript);
 	{
@@ -1814,6 +2084,7 @@ DllExport YYTKStatus PluginEntry(YYTKPlugin* PluginObject)
 	varNames.push_back("aliveFor");
 	varNames.push_back("SPD");
 	varNames.push_back("directionMoving");
+	varNames.push_back("Shrimp");
 	for (int i = 0; i < varNames.size(); i++)
 	{
 		RValue Res;
@@ -1849,6 +2120,13 @@ DllExport YYTKStatus PluginEntry(YYTKPlugin* PluginObject)
 	varNames.push_back("creator");
 	varNames.push_back("OnHitEffects");
 	varNames.push_back("onHitEffects");
+	varNames.push_back("statusEffects");
+	varNames.push_back("knockback");
+	varNames.push_back("duration");
+	varNames.push_back("isKnockback");
+	varNames.push_back("knockbackImmune");
+	varNames.push_back("showDamageText");
+	varNames.push_back("duration");
 	for (int i = 0; i < varNames.size(); i++)
 	{
 		RValue Res;
@@ -1858,6 +2136,8 @@ DllExport YYTKStatus PluginEntry(YYTKPlugin* PluginObject)
 		variableGetHashFunc(&Res, nullptr, nullptr, 1, &arg);
 		attackIndexMap[i] = CHashMap<int, RValue>::CalculateHash(static_cast<int>(Res.Real)) % (1ll << 31);
 	}
+
+	objDamageTextIndex = getAssetIndexFromName("obj_damageText");
 
 	CallBuiltin(Result, "show_debug_overlay", nullptr, nullptr, { true });
 

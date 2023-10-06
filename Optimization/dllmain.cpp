@@ -1273,6 +1273,8 @@ bool isInPickupRange(float xCur, float xOther, float yCur, float yOther, float p
 	return ((xCur - xOther) * (xCur - xOther) + (yCur - yOther) * (yCur - yOther)) <= pickupRange * pickupRange;
 }
 
+RValue* timePtr = nullptr;
+
 // This callback is registered on EVT_PRESENT and EVT_ENDSCENE, so it gets called every frame on DX9 / DX11 games.
 YYTKStatus FrameCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 {
@@ -1295,6 +1297,12 @@ YYTKStatus FrameCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 		}
 		std::sort(sortVec.begin(), sortVec.end(), std::greater<>());
 		outFile << "Frame Number: " << FrameNumber << " totTime: " << totTime << "\n";
+		if (timePtr != nullptr)
+		{
+			char buffer[100];
+			sprintf(buffer, "%d:%02d:%02d\n", static_cast<int>(timePtr->RefArray->m_Array[0].Real), static_cast<int>(timePtr->RefArray->m_Array[1].Real), static_cast<int>(timePtr->RefArray->m_Array[2].Real));
+			outFile << buffer;
+		}
 		if (hitTargetFuncTime > 1000)
 		{
 			outFile << "hitTargetFuncTime: " << hitTargetFuncTime << " num times: " << hitTargetNumTimes << "\n";
@@ -1483,11 +1491,21 @@ YYTKStatus CodeCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 		else if (_strcmpi(Code->i_pName, "gml_Object_obj_Player_Create_0") == 0) // Assume a new game has started
 		{
 			auto Player_Create_0 = [](YYTKCodeEvent* pCodeEvent, CInstance* Self, CInstance* Other, CCode* Code, RValue* Res, int Flags) {
+				{
+					RValue Res;
+					RValue arg{};
+					arg.Kind = VALUE_STRING;
+					arg.String = RefString::Alloc("time", 4);
+					variableGetHashFunc(&Res, nullptr, nullptr, 1, &arg);
+					int timeHash = CHashMap<int, RValue>::CalculateHash(static_cast<int>(Res.Real)) % (1ll << 31);
+					globalInstancePtr->m_yyvarsMap->FindElement(timeHash, timePtr);
+				}
 				PickupRangePotentialUpdate = true;
 				FrameNumber = 0;
 				LastRainbowEXPFrameNumber = 0;
 				NumberOfEnemiesCreated = 0;
 				NumberOfEnemyDeadCreated = 0;
+				numDamageText = 0;
 				EXPIDMap.clear();
 				attackHitCooldownMap.clear();
 				bucketGridMap.clear();

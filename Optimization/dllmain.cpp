@@ -1483,6 +1483,75 @@ void VariableInstanceGetNamesDetour(RValue* Result, CInstance* Self, CInstance* 
 	origVariableInstanceGetNamesScript(Result, Self, Other, numArgs, Args);
 }
 
+
+ScriptFunc origGLRMeshSubmeshScript = nullptr;
+
+TRoutine dsListCopyFunc = nullptr;
+TRoutine dsListFindValueFunc = nullptr;
+TRoutine dsListCreateFunc = nullptr;
+TRoutine dsListAddFunc = nullptr;
+static const char* enemyMeshBoundingBox = "[[-6,-4],[5,-4],[5,-15],[-6,-15]]";
+static int enemyBoundingBoxList = -1;
+
+YYRValue* GLRMeshSubmeshFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
+{
+	bool isEnemy = false;
+	if (strcmp(enemyMeshBoundingBox, Args[1]->String->m_Thing) == 0)
+	{
+		isEnemy = true;
+	}
+	if (enemyBoundingBoxList != -1 && isEnemy)
+	{
+		RValue Result;
+		RValue inputArgs[2];
+		inputArgs[0].Kind = VALUE_REAL;
+		inputArgs[0].Real = Args[0]->Real;
+		inputArgs[1].Kind = VALUE_REAL;
+		inputArgs[1].Real = 6;
+		dsListFindValueFunc(&Result, Self, Other, 2, inputArgs);
+		inputArgs[0].Kind = VALUE_REAL;
+		inputArgs[0].Real = Result.Real;
+		inputArgs[1].Kind = VALUE_REAL;
+		inputArgs[1].Real = enemyBoundingBoxList;
+		dsListAddFunc(&Result, Self, Other, 2, inputArgs);
+		return nullptr;
+	}
+	YYRValue* res = origGLRMeshSubmeshScript(Self, Other, ReturnValue, numArgs, Args);
+	if (enemyBoundingBoxList == -1 && isEnemy)
+	{
+		RValue Result;
+		RValue inputArgs[2];
+		dsListCreateFunc(&Result, Self, Other, 0, inputArgs);
+		enemyBoundingBoxList = Result.Real;
+		inputArgs[0].Kind = VALUE_REAL;
+		inputArgs[0].Real = Args[0]->Real;
+		inputArgs[1].Kind = VALUE_REAL;
+		inputArgs[1].Real = 6;
+		dsListFindValueFunc(&Result, Self, Other, 2, inputArgs);
+		inputArgs[0].Kind = VALUE_REAL;
+		inputArgs[0].Real = Result.Real;
+		inputArgs[1].Kind = VALUE_REAL;
+		inputArgs[1].Real = 0;
+		dsListFindValueFunc(&Result, Self, Other, 2, inputArgs);
+		inputArgs[0].Kind = VALUE_REAL;
+		inputArgs[0].Real = enemyBoundingBoxList;
+		inputArgs[1].Kind = VALUE_REAL;
+		inputArgs[1].Real = Result.Real;
+		dsListCopyFunc(&Result, Self, Other, 2, inputArgs);
+	}
+	return res;
+};
+
+TRoutine origDSListDestroyScript = nullptr;
+void DSListDestroyDetour(RValue* Result, CInstance* Self, CInstance* Other, int numArgs, RValue* Args)
+{
+	if (Args[0].Real == enemyBoundingBoxList)
+	{
+		return;
+	}
+	origDSListDestroyScript(Result, Self, Other, numArgs, Args);
+}
+
 int hashCoords(int xPos, int yPos)
 {
 	return xPos * 4129 + yPos * 4127;
@@ -2244,11 +2313,7 @@ DllExport YYTKStatus PluginEntry(YYTKPlugin* PluginObject)
 	HookScriptFunction("gml_Script_SpawnMob_gml_Object_obj_MobManager_Create_0",				(void*)&SpawnMobFuncDetour,					(void**)&origSpawnMobScript);
 	HookScriptFunction("gml_Script_ActualSpawn_SpawnMob_gml_Object_obj_MobManager_Create_0",	(void*)&ActualSpawnMobFuncDetour,			(void**)&origActualSpawnMobScript);
 	HookScriptFunction("gml_Script_variable_struct_copy",										(void*)&VariableStructCopyFuncDetour,		(void**)&origVariableStructCopyScript);
-	/*
-	HookScriptFunction("gml_Script_glr_mesh_create", (void*)&GLRMeshCreateFuncDetour, (void**)&origGLRMeshCreateScript);
-	HookScriptFunction("gml_Script_glr_mesh_submesh_add_json", (void*)&GLRMeshSubmeshFuncDetour, (void**)&origGLRMeshSubmeshScript);
-	HookScriptFunction("gml_Script_glr_mesh_update", (void*)&GLRMeshUpdateFuncDetour, (void**)&origGLRMeshUpdateScript);
-	*/
+	HookScriptFunction("gml_Script_glr_mesh_submesh_add_json",									(void*)&GLRMeshSubmeshFuncDetour,			(void**)&origGLRMeshSubmeshScript);
 	GetFunctionByName("method_call", scriptExecuteFunc);
 
 	TRoutine variableStructExists;
@@ -2323,6 +2388,15 @@ DllExport YYTKStatus PluginEntry(YYTKPlugin* PluginObject)
 		"InstanceCreateLayerScript"
 	);
 
+	TRoutine dsListDestroyScript;
+	GetFunctionByName("ds_list_destroy", dsListDestroyScript);
+	Hook(
+		(void*)&DSListDestroyDetour,
+		(void*)(dsListDestroyScript),
+		(void**)&origDSListDestroyScript,
+		"DSListDestroyScript"
+	);
+
 	TRoutine globalScript;
 	GetFunctionByName("@@GlobalScope@@", globalScript);
 	{
@@ -2335,6 +2409,10 @@ DllExport YYTKStatus PluginEntry(YYTKPlugin* PluginObject)
 	GetFunctionByName("variable_clone", variableCloneFunc);
 	GetFunctionByName("struct_set_from_hash", structSetFromHashFunc);
 	GetFunctionByName("array_create", arrayCreateFunc);
+	GetFunctionByName("ds_list_copy", dsListCopyFunc);
+	GetFunctionByName("ds_list_find_value", dsListFindValueFunc);
+	GetFunctionByName("ds_list_create", dsListCreateFunc);
+	GetFunctionByName("ds_list_add", dsListAddFunc);
 
 	std::vector<const char*> varNames;
 	varNames.push_back("collidedCD");

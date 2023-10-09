@@ -1093,17 +1093,6 @@ void StringDetour(RValue* Result, CInstance* Self, CInstance* Other, int numArgs
 	origStringScript(Result, Self, Other, numArgs, Args);
 }
 
-TRoutine origVariableInstanceGetNamesScript = nullptr;
-void VariableInstanceGetNamesDetour(RValue* Result, CInstance* Self, CInstance* Other, int numArgs, RValue* Args)
-{
-	if (isInDieFunc)
-	{
-		Result->Kind = VALUE_UNSET;
-		return;
-	}
-	origVariableInstanceGetNamesScript(Result, Self, Other, numArgs, Args);
-}
-
 TRoutine origArrayLengthScript = nullptr;
 void ArrayLengthDetour(RValue* Result, CInstance* Self, CInstance* Other, int numArgs, RValue* Args)
 {
@@ -1267,13 +1256,17 @@ ScriptFunc origSpawnMobScript = nullptr;
 static long long spawnMobFuncTime = 0;
 static int spawnMobNumTimes = 0;
 
+static bool isInSpawnMobFunc = false;
+
 YYRValue* SpawnMobFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
+	isInSpawnMobFunc = true;
 	auto start = std::chrono::high_resolution_clock::now();
 	YYRValue* res = origSpawnMobScript(Self, Other, ReturnValue, numArgs, Args);
 	auto end = std::chrono::high_resolution_clock::now();
 	spawnMobFuncTime += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 	spawnMobNumTimes++;
+	isInSpawnMobFunc = false;
 	return res;
 };
 
@@ -1392,13 +1385,21 @@ void DeepStructCopy(CInstance* Self, RValue* copyFromObject, RValue* copyToObjec
 ScriptFunc origActualSpawnMobScript = nullptr;
 static long long acutalSpawnMobFuncTime = 0;
 static int actualSpawnMobNumTimes = 0;
+
+static bool isInActualSpawnMobFunc = false;
+
 YYRValue* ActualSpawnMobFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
+	bool prevIsInSpawnMobFunc = isInSpawnMobFunc;
+	isInSpawnMobFunc = false;
+	isInActualSpawnMobFunc = true;
 	auto start = std::chrono::high_resolution_clock::now();
 	YYRValue* res = origActualSpawnMobScript(Self, Other, ReturnValue, numArgs, Args);
 	auto end = std::chrono::high_resolution_clock::now();
 	acutalSpawnMobFuncTime += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 	actualSpawnMobNumTimes++;
+	isInActualSpawnMobFunc = false;
+	isInSpawnMobFunc = prevIsInSpawnMobFunc;
 	return res;
 };
 
@@ -1427,6 +1428,60 @@ YYRValue* VariableStructCopyFuncDetour(CInstance* Self, CInstance* Other, YYRVal
 	variableStructCopyNumTimes++;
 	return res;
 };
+
+TRoutine origInstanceCreateLayerScript = nullptr;
+void* curMob = nullptr;
+
+void InstanceCreateLayerDetour(RValue* Result, CInstance* Self, CInstance* Other, int numArgs, RValue* Args)
+{
+	origInstanceCreateLayerScript(Result, Self, Other, numArgs, Args);
+	if (isInSpawnMobFunc)
+	{
+		curMob = Result->Pointer;
+	}
+}
+
+TRoutine origVariableInstanceGetNamesScript = nullptr;
+void VariableInstanceGetNamesDetour(RValue* Result, CInstance* Self, CInstance* Other, int numArgs, RValue* Args)
+{
+	if (isInDieFunc)
+	{
+		Result->Kind = VALUE_UNSET;
+		return;
+	}
+	if (isInSpawnMobFunc || isInActualSpawnMobFunc)
+	{
+		int spriteIndexHash = baseMobVarIndexMap[7];
+		RValue* spriteIndexPtr = nullptr;
+		if (Args[0].Object->m_yyvarsMap->FindElement(spriteIndexHash, spriteIndexPtr))
+		{
+			RValue setStruct;
+			if (isInActualSpawnMobFunc)
+			{
+				setStruct.Kind = VALUE_OBJECT;
+				setStruct.Instance = Self;
+			}
+			else
+			{
+				setStruct.Kind = VALUE_REF;
+				setStruct.Pointer = curMob;
+			}
+			auto configMap = Args[0].Object->m_yyvarsMap;
+			for (int i = 0; i < configMap->m_curSize; i++)
+			{
+				int curHash = configMap->m_pBuckets[i].Hash;
+				if (curHash != 0 && curHash != spriteIndexHash)
+				{
+					StructSetFromHash(Self, &setStruct, configMap->m_pBuckets[i].k, configMap->m_pBuckets[i].v);
+				}
+			}
+			curMob = nullptr;
+			Result->Kind = VALUE_UNSET;
+			return;
+		}
+	}
+	origVariableInstanceGetNamesScript(Result, Self, Other, numArgs, Args);
+}
 
 int hashCoords(int xPos, int yPos)
 {
@@ -2259,6 +2314,15 @@ DllExport YYTKStatus PluginEntry(YYTKPlugin* PluginObject)
 		"InstanceCreateDepthScript"
 	);
 
+	TRoutine instanceCreateLayerScript;
+	GetFunctionByName("instance_create_layer", instanceCreateLayerScript);
+	Hook(
+		(void*)&InstanceCreateLayerDetour,
+		(void*)(instanceCreateLayerScript),
+		(void**)&origInstanceCreateLayerScript,
+		"InstanceCreateLayerScript"
+	);
+
 	TRoutine globalScript;
 	GetFunctionByName("@@GlobalScope@@", globalScript);
 	{
@@ -2308,6 +2372,7 @@ DllExport YYTKStatus PluginEntry(YYTKPlugin* PluginObject)
 	varNames.push_back("onTakeDamageAfter");
 	varNames.push_back("onDodge");
 	varNames.push_back("invincible");
+	varNames.push_back("sprite_index");
 	for (int i = 0; i < varNames.size(); i++)
 	{
 		RValue Res;

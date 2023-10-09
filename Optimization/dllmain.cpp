@@ -1263,6 +1263,171 @@ YYRValue* DropEXPFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnV
 	return res;
 };
 
+ScriptFunc origSpawnMobScript = nullptr;
+static long long spawnMobFuncTime = 0;
+static int spawnMobNumTimes = 0;
+
+YYRValue* SpawnMobFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
+{
+	auto start = std::chrono::high_resolution_clock::now();
+	YYRValue* res = origSpawnMobScript(Self, Other, ReturnValue, numArgs, Args);
+	auto end = std::chrono::high_resolution_clock::now();
+	spawnMobFuncTime += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+	spawnMobNumTimes++;
+	return res;
+};
+
+TRoutine variableCloneFunc = nullptr;
+TRoutine structSetFromHashFunc = nullptr;
+TRoutine arrayCreateFunc = nullptr;
+YYObjectBase* curStructPtr = nullptr;
+
+void CreateEmptyStruct(CInstance* Self, YYObjectBase* structPtr, RValue* copyToRValue)
+{
+	RValue inputArg[1];
+	inputArg[0].Kind = VALUE_OBJECT;
+	inputArg[0].Object = structPtr;
+	auto prevMap = structPtr->m_yyvarsMap;
+	structPtr->m_yyvarsMap = nullptr;
+	variableCloneFunc(copyToRValue, Self, nullptr, 1, inputArg);
+	structPtr->m_yyvarsMap = prevMap;
+}
+
+void StructSetFromHash(CInstance* Self, RValue* setStruct, int hash, RValue* setVal)
+{
+	RValue Result;
+	RValue inputArgs[3];
+	inputArgs[0] = *setStruct;
+	inputArgs[1].Kind = VALUE_REAL;
+	inputArgs[1].Real = hash;
+	inputArgs[2] = *setVal;
+	structSetFromHashFunc(&Result, Self, nullptr, 3, inputArgs);
+}
+
+void DeepStructCopy(CInstance* Self, RValue* copyFromObject, RValue* copyToObject)
+{
+	if (copyFromObject->Kind == VALUE_OBJECT)
+	{
+		auto copyFromMap = copyFromObject->Object->m_yyvarsMap;
+		if (copyFromMap == nullptr)
+		{
+			return;
+		}
+		for (int i = 0; i < copyFromMap->m_curSize; i++)
+		{
+			int curHash = copyFromMap->m_pBuckets[i].Hash;
+			if (curHash != 0)
+			{
+				RValue* curRValue = copyFromMap->m_pBuckets[i].v;
+				//m_kind is 0 when struct and 3 when method
+				if (curRValue->Kind == VALUE_OBJECT && curRValue->Object->m_kind == 0)
+				{
+					RValue newStruct;
+					CreateEmptyStruct(Self, curStructPtr, &newStruct);
+					DeepStructCopy(Self, curRValue, &newStruct);
+					StructSetFromHash(Self, copyToObject, copyFromMap->m_pBuckets[i].k, &newStruct);
+				}
+				else if (curRValue->Kind == VALUE_ARRAY)
+				{
+					RValue newArray;
+					RValue inputArg[2];
+					inputArg[0].Kind = VALUE_REAL;
+					inputArg[0].Real = curRValue->RefArray->length;
+					arrayCreateFunc(&newArray, Self, nullptr, 1, inputArg);
+					DeepStructCopy(Self, curRValue, &newArray);
+					StructSetFromHash(Self, copyToObject, copyFromMap->m_pBuckets[i].k, &newArray);
+					
+				}
+				else
+				{
+					StructSetFromHash(Self, copyToObject, copyFromMap->m_pBuckets[i].k, curRValue);
+				}
+			}
+		}
+	}
+	else if (copyFromObject->Kind = VALUE_ARRAY)
+	{
+		auto copyFromArr = copyFromObject->RefArray;
+		auto copyToArr = copyToObject->RefArray;
+		for (int i = 0; i < copyFromArr->length; i++)
+		{
+			auto curRValue = copyFromArr->m_Array[i];
+			
+			if (curRValue.Kind == VALUE_OBJECT && curRValue.Object->m_kind == 0)
+			{
+				RValue newStruct;
+				CreateEmptyStruct(Self, curStructPtr, &newStruct);
+				DeepStructCopy(Self, &curRValue, &newStruct);
+				copyToArr->m_Array[i].Kind = VALUE_OBJECT;
+				copyToArr->m_Array[i].Object = newStruct.Object;
+			}
+			else if (curRValue.Kind == VALUE_ARRAY)
+			{
+				RValue newArray;
+				RValue inputArg[1];
+				inputArg[0].Kind = VALUE_REAL;
+				inputArg[0].Real = curRValue.RefArray->length;
+				arrayCreateFunc(&newArray, Self, nullptr, 1, inputArg);
+				DeepStructCopy(Self, &curRValue, &newArray);
+				copyToArr->m_Array[i].Kind = VALUE_ARRAY;
+				copyToArr->m_Array[i].RefArray = newArray.RefArray;
+			}
+			else if (curRValue.Kind == VALUE_STRING)
+			{
+				copyToArr->m_Array[i].Kind = VALUE_STRING;
+				copyToArr->m_Array[i].String = RefString::Alloc(copyFromArr->m_Array[i].String->m_Thing, strlen(copyFromArr->m_Array[i].String->m_Thing));
+			}
+			else
+			{
+				memcpy(&(copyToArr->m_Array[i]), &curRValue, sizeof(RValue));
+			}
+		}
+	}
+	else
+	{
+		PrintMessage(CLR_RED, "UNEXPECTED COPY TYPE");
+	}
+}
+
+ScriptFunc origActualSpawnMobScript = nullptr;
+static long long acutalSpawnMobFuncTime = 0;
+static int actualSpawnMobNumTimes = 0;
+YYRValue* ActualSpawnMobFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
+{
+	auto start = std::chrono::high_resolution_clock::now();
+	YYRValue* res = origActualSpawnMobScript(Self, Other, ReturnValue, numArgs, Args);
+	auto end = std::chrono::high_resolution_clock::now();
+	acutalSpawnMobFuncTime += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+	actualSpawnMobNumTimes++;
+	return res;
+};
+
+ScriptFunc origVariableStructCopyScript = nullptr;
+static long long variableStructCopyFuncTime = 0;
+static int variableStructCopyNumTimes = 0;
+YYRValue* VariableStructCopyFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
+{
+	if (Args[0]->Kind == VALUE_OBJECT)
+	{
+		auto start = std::chrono::high_resolution_clock::now();
+		curStructPtr = Args[0]->Object;
+		
+		DeepStructCopy(Self, (RValue*)Args[0], (RValue*)Args[1]);
+		
+		curStructPtr = nullptr;
+		auto end = std::chrono::high_resolution_clock::now();
+		variableStructCopyFuncTime += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+		variableStructCopyNumTimes++;
+		return Args[1];
+	}
+	auto start = std::chrono::high_resolution_clock::now();
+	YYRValue* res = origVariableStructCopyScript(Self, Other, ReturnValue, numArgs, Args);
+	auto end = std::chrono::high_resolution_clock::now();
+	variableStructCopyFuncTime += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+	variableStructCopyNumTimes++;
+	return res;
+};
+
 int hashCoords(int xPos, int yPos)
 {
 	return xPos * 4129 + yPos * 4127;
@@ -1302,6 +1467,12 @@ YYTKStatus FrameCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 			char buffer[100];
 			sprintf(buffer, "%d:%02d:%02d\n", static_cast<int>(timePtr->RefArray->m_Array[0].Real), static_cast<int>(timePtr->RefArray->m_Array[1].Real), static_cast<int>(timePtr->RefArray->m_Array[2].Real));
 			outFile << buffer;
+		}
+		if (spawnMobFuncTime > 1000)
+		{
+			outFile << "spawnMobFuncTime: " << spawnMobFuncTime << " num times: " << spawnMobNumTimes << "\n";
+			outFile << "acutalSpawnMobFuncTime: " << acutalSpawnMobFuncTime << " num times: " << actualSpawnMobNumTimes << "\n";
+			outFile << "variableStructCopyFuncTime: " << variableStructCopyFuncTime << " num times: " << variableStructCopyNumTimes << "\n";
 		}
 		if (hitTargetFuncTime > 1000)
 		{
@@ -1417,6 +1588,12 @@ YYTKStatus FrameCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 	VariableStructExistsFastNumTimes = 0;
 	VariableStructExistsSlowFuncTime = 0;
 	VariableStructExistsSlowNumTimes = 0;
+	spawnMobFuncTime = 0;
+	spawnMobNumTimes = 0;
+	acutalSpawnMobFuncTime = 0;
+	actualSpawnMobNumTimes = 0;
+	variableStructCopyFuncTime = 0;
+	variableStructCopyNumTimes = 0;
 	totTime = 0;
 	ProfilerMap.clear();
 	funcParams.clear();
@@ -2009,7 +2186,14 @@ DllExport YYTKStatus PluginEntry(YYTKPlugin* PluginObject)
 	HookScriptFunction("gml_Script_AfterCriticalHit_gml_Object_obj_BaseMob_Create_0",			(void*)&AfterCriticalHitFuncDetour,			(void**)&origAfterCriticalHitScript);
 	HookScriptFunction("gml_Script_BeforeDamageCalculation_gml_Object_obj_BaseMob_Create_0",	(void*)&BeforeDamageCalculationFuncDetour,	(void**)&origBeforeDamageCalculationScript);
 	HookScriptFunction("gml_Script_DropExp_gml_Object_obj_Enemy_Create_0",						(void*)&DropEXPFuncDetour,					(void**)&origDropEXPScript);
-
+	HookScriptFunction("gml_Script_SpawnMob_gml_Object_obj_MobManager_Create_0",				(void*)&SpawnMobFuncDetour,					(void**)&origSpawnMobScript);
+	HookScriptFunction("gml_Script_ActualSpawn_SpawnMob_gml_Object_obj_MobManager_Create_0",	(void*)&ActualSpawnMobFuncDetour,			(void**)&origActualSpawnMobScript);
+	HookScriptFunction("gml_Script_variable_struct_copy",										(void*)&VariableStructCopyFuncDetour,		(void**)&origVariableStructCopyScript);
+	/*
+	HookScriptFunction("gml_Script_glr_mesh_create", (void*)&GLRMeshCreateFuncDetour, (void**)&origGLRMeshCreateScript);
+	HookScriptFunction("gml_Script_glr_mesh_submesh_add_json", (void*)&GLRMeshSubmeshFuncDetour, (void**)&origGLRMeshSubmeshScript);
+	HookScriptFunction("gml_Script_glr_mesh_update", (void*)&GLRMeshUpdateFuncDetour, (void**)&origGLRMeshUpdateScript);
+	*/
 	GetFunctionByName("method_call", scriptExecuteFunc);
 
 	TRoutine variableStructExists;
@@ -2084,6 +2268,9 @@ DllExport YYTKStatus PluginEntry(YYTKPlugin* PluginObject)
 	}
 
 	GetFunctionByName("variable_get_hash", variableGetHashFunc);
+	GetFunctionByName("variable_clone", variableCloneFunc);
+	GetFunctionByName("struct_set_from_hash", structSetFromHashFunc);
+	GetFunctionByName("array_create", arrayCreateFunc);
 
 	std::vector<const char*> varNames;
 	varNames.push_back("collidedCD");

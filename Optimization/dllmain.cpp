@@ -15,6 +15,7 @@ FNScriptData scriptList = nullptr;
 TRoutine assetGetIndexFunc;
 TRoutine variableGetHashFunc;
 CInstance* globalInstancePtr = nullptr;
+static int objEnemyIndex = -1;
 
 YYTKStatus MmGetScriptData(FNScriptData& outScript)
 {
@@ -760,7 +761,7 @@ YYRValue* ApplyDamageFuncDetour(CInstance* Self, CInstance* Other, YYRValue* Ret
 ScriptFunc origHitNumberScript = nullptr;
 static long long hitNumberFuncTime = 0;
 static int hitNumberNumTimes = 0;
-static int objDamageTextIndex = -1;;
+static int objDamageTextIndex = -1;
 
 static int numDamageText = 0;
 
@@ -1483,73 +1484,222 @@ void VariableInstanceGetNamesDetour(RValue* Result, CInstance* Self, CInstance* 
 	origVariableInstanceGetNamesScript(Result, Self, Other, numArgs, Args);
 }
 
+ScriptFunc origGLRLightSetActiveScript = nullptr;
+
+YYRValue* GLRLightSetActiveFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
+{
+	return origGLRLightSetActiveScript(Self, Other, ReturnValue, numArgs, Args);
+};
 
 ScriptFunc origGLRMeshSubmeshScript = nullptr;
 
-TRoutine dsListCopyFunc = nullptr;
-TRoutine dsListFindValueFunc = nullptr;
-TRoutine dsListCreateFunc = nullptr;
-TRoutine dsListAddFunc = nullptr;
 static const char* enemyMeshBoundingBox = "[[-6,-4],[5,-4],[5,-15],[-6,-15]]";
-static int enemyBoundingBoxList = -1;
+static std::unordered_map<int, int> meshIndices;
+static std::queue<int> availableMeshes;
 
-YYRValue* GLRMeshSubmeshFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
+static int numSpawnAdditionalMesh = 20;
+static int idealMinAvailableMeshes = 150;
+
+ScriptFunc origGLRMeshCreateScript = nullptr;
+YYRValue* GLRMeshInputArgs[3];
+
+YYRValue* GLRMeshCreateFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
-	bool isEnemy = false;
-	if (strcmp(enemyMeshBoundingBox, Args[1]->String->m_Thing) == 0)
+	if (Self->i_objectindex == objEnemyIndex && !availableMeshes.empty())
 	{
-		isEnemy = true;
+		int meshIndex = availableMeshes.front();
+		availableMeshes.pop();
+
+		YYRValue Result;
+		if (GLRMeshInputArgs[0] == nullptr)
+		{
+			GLRMeshInputArgs[0] = new YYRValue();
+			GLRMeshInputArgs[1] = new YYRValue();
+			GLRMeshInputArgs[2] = new YYRValue();
+		}
+
+		GLRMeshInputArgs[0]->Kind = VALUE_REAL;
+		GLRMeshInputArgs[0]->Real = meshIndex;
+		GLRMeshInputArgs[1]->Kind = VALUE_REAL;
+		GLRMeshInputArgs[1]->Real = 1;
+		origGLRLightSetActiveScript(Self, Other, &Result, 2, GLRMeshInputArgs);
+
+		ReturnValue->Kind = VALUE_REAL;
+		ReturnValue->Real = meshIndex;
+		return ReturnValue;
 	}
-	if (enemyBoundingBoxList != -1 && isEnemy)
-	{
-		RValue Result;
-		RValue inputArgs[2];
-		inputArgs[0].Kind = VALUE_REAL;
-		inputArgs[0].Real = Args[0]->Real;
-		inputArgs[1].Kind = VALUE_REAL;
-		inputArgs[1].Real = 6;
-		dsListFindValueFunc(&Result, Self, Other, 2, inputArgs);
-		inputArgs[0].Kind = VALUE_REAL;
-		inputArgs[0].Real = Result.Real;
-		inputArgs[1].Kind = VALUE_REAL;
-		inputArgs[1].Real = enemyBoundingBoxList;
-		dsListAddFunc(&Result, Self, Other, 2, inputArgs);
-		return nullptr;
-	}
-	YYRValue* res = origGLRMeshSubmeshScript(Self, Other, ReturnValue, numArgs, Args);
-	if (enemyBoundingBoxList == -1 && isEnemy)
-	{
-		RValue Result;
-		RValue inputArgs[2];
-		dsListCreateFunc(&Result, Self, Other, 0, inputArgs);
-		enemyBoundingBoxList = Result.Real;
-		inputArgs[0].Kind = VALUE_REAL;
-		inputArgs[0].Real = Args[0]->Real;
-		inputArgs[1].Kind = VALUE_REAL;
-		inputArgs[1].Real = 6;
-		dsListFindValueFunc(&Result, Self, Other, 2, inputArgs);
-		inputArgs[0].Kind = VALUE_REAL;
-		inputArgs[0].Real = Result.Real;
-		inputArgs[1].Kind = VALUE_REAL;
-		inputArgs[1].Real = 0;
-		dsListFindValueFunc(&Result, Self, Other, 2, inputArgs);
-		inputArgs[0].Kind = VALUE_REAL;
-		inputArgs[0].Real = enemyBoundingBoxList;
-		inputArgs[1].Kind = VALUE_REAL;
-		inputArgs[1].Real = Result.Real;
-		dsListCopyFunc(&Result, Self, Other, 2, inputArgs);
-	}
-	return res;
+	return origGLRMeshCreateScript(Self, Other, ReturnValue, numArgs, Args);
 };
 
-TRoutine origDSListDestroyScript = nullptr;
-void DSListDestroyDetour(RValue* Result, CInstance* Self, CInstance* Other, int numArgs, RValue* Args)
+ScriptFunc origGLRMeshUpdateScript = nullptr;
+
+YYRValue* GLRMeshUpdateFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
-	if (Args[0].Real == enemyBoundingBoxList)
+	int listNum = static_cast<int>(Args[0]->Real);
+	if (meshIndices.find(listNum) != meshIndices.end())
+	{
+		if (meshIndices[listNum] == 1)
+		{
+			meshIndices[listNum] = 2;
+		}
+		else
+		{
+			meshIndices[listNum] = 2;
+			return nullptr;
+		}
+	}
+	return origGLRMeshUpdateScript(Self, Other, ReturnValue, numArgs, Args);
+};
+
+void moveMeshToQueue(CInstance* Self, int listNum)
+{
+	if (meshIndices[listNum] == 3)
 	{
 		return;
 	}
-	origDSListDestroyScript(Result, Self, Other, numArgs, Args);
+	meshIndices[listNum] = 3;
+	YYRValue Result;
+	if (GLRMeshInputArgs[0] == nullptr)
+	{
+		GLRMeshInputArgs[0] = new YYRValue();
+		GLRMeshInputArgs[1] = new YYRValue();
+		GLRMeshInputArgs[2] = new YYRValue();
+	}
+
+	GLRMeshInputArgs[0]->Kind = VALUE_REAL;
+	GLRMeshInputArgs[0]->Real = listNum;
+	GLRMeshInputArgs[1]->Kind = VALUE_REAL;
+	GLRMeshInputArgs[1]->Real = 0;
+	origGLRLightSetActiveScript(Self, nullptr, &Result, 2, GLRMeshInputArgs);
+
+	availableMeshes.push(listNum);
+}
+
+YYRValue* GLRMeshSubmeshFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
+{
+	int meshListNum = static_cast<int>(Args[0]->Real);
+	if (numSpawnAdditionalMesh > 0 && availableMeshes.size() < idealMinAvailableMeshes && strcmp(enemyMeshBoundingBox, Args[1]->String->m_Thing) == 0)
+	{
+		while (numSpawnAdditionalMesh > 0 && availableMeshes.size() < idealMinAvailableMeshes)
+		{
+			numSpawnAdditionalMesh--;
+			if (GLRMeshInputArgs[0] == nullptr)
+			{
+				GLRMeshInputArgs[0] = new YYRValue();
+				GLRMeshInputArgs[1] = new YYRValue();
+				GLRMeshInputArgs[2] = new YYRValue();
+			}
+			GLRMeshInputArgs[0]->Kind = VALUE_REAL;
+			GLRMeshInputArgs[0]->Real = 0;
+			GLRMeshInputArgs[1]->Kind = VALUE_REAL;
+			GLRMeshInputArgs[1]->Real = 0;
+			GLRMeshInputArgs[2]->Kind = VALUE_REAL;
+			GLRMeshInputArgs[2]->Real = 0;
+			origGLRMeshCreateScript(Self, Other, ReturnValue, 3, GLRMeshInputArgs);
+			int listNum = static_cast<int>(ReturnValue->Real);
+			Args[0]->Real = listNum;
+			origGLRMeshSubmeshScript(Self, Other, ReturnValue, numArgs, Args);
+			meshIndices[listNum] = 2;
+			GLRMeshInputArgs[0]->Real = listNum;
+			origGLRMeshUpdateScript(Self, Other, ReturnValue, 1, GLRMeshInputArgs);
+			moveMeshToQueue(Self, listNum);
+		}
+	}
+	Args[0]->Real = meshListNum;
+	if (meshIndices.find(meshListNum) != meshIndices.end())
+	{
+		return nullptr;
+	}
+	if (strcmp(enemyMeshBoundingBox, Args[1]->String->m_Thing) == 0)
+	{
+		meshIndices[meshListNum] = 1;
+	}
+	return origGLRMeshSubmeshScript(Self, Other, ReturnValue, numArgs, Args);
+};
+
+ScriptFunc origGLRMeshDestroyScript = nullptr;
+
+YYRValue* GLRMeshDestroyFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
+{
+	int listNum = static_cast<int>(Args[0]->Real);
+	if (meshIndices.find(listNum) != meshIndices.end())
+	{
+		moveMeshToQueue(Self, listNum);
+		return nullptr;
+	}
+	return origGLRMeshDestroyScript(Self, Other, ReturnValue, numArgs, Args);
+};
+
+ScriptFunc origCanSubmitScoreScript = nullptr;
+
+YYRValue* CanSubmitScoreFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
+{
+	ReturnValue->Kind = VALUE_BOOL;
+	ReturnValue->Real = 0;
+	return ReturnValue;
+};
+
+ScriptFunc origGLRMeshDestroyAllScript = nullptr;
+static bool isInGLRMeshDestroyAll = false;
+
+YYRValue* GLRMeshDestroyAllFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
+{
+	isInGLRMeshDestroyAll = true;
+	YYRValue* Res = origGLRMeshDestroyAllScript(Self, Other, ReturnValue, numArgs, Args);
+	isInGLRMeshDestroyAll = false;
+	return Res;
+};
+
+TRoutine DSListFindValueFunc = nullptr;
+
+TRoutine origDSListSizeScript = nullptr;
+void DSListSizeDetour(RValue* Result, CInstance* Self, CInstance* Other, int numArgs, RValue* Args)
+{
+	if (isInGLRMeshDestroyAll)
+	{
+		int GLRMeshDynListHash = baseMobVarIndexMap[8];
+		RValue* GLRMeshDynListPtr = nullptr;
+		globalInstancePtr->m_yyvarsMap->FindElement(GLRMeshDynListHash, GLRMeshDynListPtr);
+		if (static_cast<int>(GLRMeshDynListPtr->Real) == static_cast<int>(Args[0].Real))
+		{
+			origDSListSizeScript(Result, Self, Other, numArgs, Args);
+			int GLRMeshDynListSize = Result->Real;
+
+			RValue inputArgs[2];
+			inputArgs[0].Kind = VALUE_REAL;
+			inputArgs[1].Kind = VALUE_REAL;
+			for (int i = 0; i < GLRMeshDynListSize; i++)
+			{
+				inputArgs[0].Real = GLRMeshDynListPtr->Real;
+				inputArgs[1].Real = i;
+				DSListFindValueFunc(Result, Self, Other, 2, inputArgs);
+				int listNum = static_cast<int>(Result->Real);
+				moveMeshToQueue(Self, listNum);
+			}
+
+			Result->Kind = VALUE_REAL;
+			Result->Real = 0;
+			return;
+		}
+	}
+	origDSListSizeScript(Result, Self, Other, numArgs, Args);
+}
+
+TRoutine origDSListClearScript = nullptr;
+
+void DSListClearDetour(RValue* Result, CInstance* Self, CInstance* Other, int numArgs, RValue* Args)
+{
+	if (isInGLRMeshDestroyAll)
+	{
+		int GLRMeshDynListHash = baseMobVarIndexMap[8];
+		RValue* GLRMeshDynListPtr = nullptr;
+		globalInstancePtr->m_yyvarsMap->FindElement(GLRMeshDynListHash, GLRMeshDynListPtr);
+		if (static_cast<int>(GLRMeshDynListPtr->Real) == static_cast<int>(Args[0].Real))
+		{
+			return;
+		}
+	}
+	origDSListClearScript(Result, Self, Other, numArgs, Args);
 }
 
 int hashCoords(int xPos, int yPos)
@@ -1569,11 +1719,14 @@ YYTKStatus FrameCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 {
 	FrameNumber++;
 
+	numSpawnAdditionalMesh = 20;
+
 	if (FrameNumber % 60 == 0)
 	{
 		YYRValue Result;
 		PrintMessage(CLR_DEFAULT, "Number of Enemies Alive: %d, %d, %d"
 			, NumberOfEnemiesCreated - NumberOfEnemyDeadCreated, numEnemyStepSkip, numEnemyStepCall);
+		PrintMessage(CLR_DEFAULT, "available meshes: %d", availableMeshes.size());
 		numEnemyStepSkip = 0;
 		numEnemyStepCall = 0;
 	}
@@ -2313,7 +2466,14 @@ DllExport YYTKStatus PluginEntry(YYTKPlugin* PluginObject)
 	HookScriptFunction("gml_Script_SpawnMob_gml_Object_obj_MobManager_Create_0",				(void*)&SpawnMobFuncDetour,					(void**)&origSpawnMobScript);
 	HookScriptFunction("gml_Script_ActualSpawn_SpawnMob_gml_Object_obj_MobManager_Create_0",	(void*)&ActualSpawnMobFuncDetour,			(void**)&origActualSpawnMobScript);
 	HookScriptFunction("gml_Script_variable_struct_copy",										(void*)&VariableStructCopyFuncDetour,		(void**)&origVariableStructCopyScript);
+	HookScriptFunction("gml_Script_glr_mesh_destroy_all",										(void*)&GLRMeshDestroyAllFuncDetour,		(void**)&origGLRMeshDestroyAllScript);
+	HookScriptFunction("gml_Script_glr_mesh_create",											(void*)&GLRMeshCreateFuncDetour,			(void**)&origGLRMeshCreateScript);
 	HookScriptFunction("gml_Script_glr_mesh_submesh_add_json",									(void*)&GLRMeshSubmeshFuncDetour,			(void**)&origGLRMeshSubmeshScript);
+	HookScriptFunction("gml_Script_glr_mesh_update",											(void*)&GLRMeshUpdateFuncDetour,			(void**)&origGLRMeshUpdateScript);
+	HookScriptFunction("gml_Script_glr_light_set_active",										(void*)&GLRLightSetActiveFuncDetour,		(void**)&origGLRLightSetActiveScript);
+	HookScriptFunction("gml_Script_glr_mesh_destroy",											(void*)&GLRMeshDestroyFuncDetour,			(void**)&origGLRMeshDestroyScript);
+	HookScriptFunction("gml_Script_CanSubmitScore_gml_Object_obj_PlayerManager_Create_0",		(void*)&CanSubmitScoreFuncDetour,			(void**)&origCanSubmitScoreScript);
+	
 	GetFunctionByName("method_call", scriptExecuteFunc);
 
 	TRoutine variableStructExists;
@@ -2388,13 +2548,22 @@ DllExport YYTKStatus PluginEntry(YYTKPlugin* PluginObject)
 		"InstanceCreateLayerScript"
 	);
 
-	TRoutine dsListDestroyScript;
-	GetFunctionByName("ds_list_destroy", dsListDestroyScript);
+	TRoutine dsListSizeScript;
+	GetFunctionByName("ds_list_size", dsListSizeScript);
 	Hook(
-		(void*)&DSListDestroyDetour,
-		(void*)(dsListDestroyScript),
-		(void**)&origDSListDestroyScript,
-		"DSListDestroyScript"
+		(void*)&DSListSizeDetour,
+		(void*)(dsListSizeScript),
+		(void**)&origDSListSizeScript,
+		"DSListSizeScript"
+	);
+
+	TRoutine dsListClearScript;
+	GetFunctionByName("ds_list_clear", dsListClearScript);
+	Hook(
+		(void*)&DSListClearDetour,
+		(void*)(dsListClearScript),
+		(void**)&origDSListClearScript,
+		"DSListClearScript"
 	);
 
 	TRoutine globalScript;
@@ -2409,10 +2578,7 @@ DllExport YYTKStatus PluginEntry(YYTKPlugin* PluginObject)
 	GetFunctionByName("variable_clone", variableCloneFunc);
 	GetFunctionByName("struct_set_from_hash", structSetFromHashFunc);
 	GetFunctionByName("array_create", arrayCreateFunc);
-	GetFunctionByName("ds_list_copy", dsListCopyFunc);
-	GetFunctionByName("ds_list_find_value", dsListFindValueFunc);
-	GetFunctionByName("ds_list_create", dsListCreateFunc);
-	GetFunctionByName("ds_list_add", dsListAddFunc);
+	GetFunctionByName("ds_list_find_value", DSListFindValueFunc);
 
 	std::vector<const char*> varNames;
 	varNames.push_back("collidedCD");
@@ -2451,6 +2617,7 @@ DllExport YYTKStatus PluginEntry(YYTKPlugin* PluginObject)
 	varNames.push_back("onDodge");
 	varNames.push_back("invincible");
 	varNames.push_back("sprite_index");
+	varNames.push_back("GLR_MESH_DYN_LIST");
 	for (int i = 0; i < varNames.size(); i++)
 	{
 		RValue Res;
@@ -2486,6 +2653,7 @@ DllExport YYTKStatus PluginEntry(YYTKPlugin* PluginObject)
 	}
 
 	objDamageTextIndex = getAssetIndexFromName("obj_damageText");
+	objEnemyIndex = getAssetIndexFromName("obj_Enemy");
 
 	CallBuiltin(Result, "show_debug_overlay", nullptr, nullptr, { true });
 

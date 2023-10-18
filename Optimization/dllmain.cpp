@@ -1,4 +1,7 @@
 #define YYSDK_PLUGIN
+#define ENABLEPROFILER 0
+#define MICROSECONDS 1000
+#define NANOSECONDS	1
 #include "DllMain.hpp"	// Include our header
 #include <Windows.h>    // Include Windows's mess.
 #include <vector>       // Include the STL vector.
@@ -16,6 +19,8 @@ TRoutine assetGetIndexFunc;
 TRoutine variableGetHashFunc;
 CInstance* globalInstancePtr = nullptr;
 static int objEnemyIndex = -1;
+static int objPreCreateIndex = -1;
+static int objAttackIndex = -1;
 
 YYTKStatus MmGetScriptData(FNScriptData& outScript)
 {
@@ -93,6 +98,37 @@ void HookScriptFunction(const char* scriptFunctionName, void* detourFunction, vo
 		origScript,
 		scriptFunctionName
 	);
+}
+
+inline long long StartProfilerTime()
+{
+	if (ENABLEPROFILER)
+	{
+		return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+	}
+	return 0;
+}
+
+inline void EndProfilerTime(long long startTime, long long timeType, long long& funcTime, int& numTimes)
+{
+	if (ENABLEPROFILER)
+	{
+		funcTime += (std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now().time_since_epoch()).count() - startTime) / timeType;
+		numTimes++;
+	}
+}
+
+TRoutine structSetFromHashFunc = nullptr;
+
+void StructSetFromHash(CInstance* Self, RValue* setStruct, int hash, RValue* setVal)
+{
+	RValue Result;
+	RValue inputArgs[3];
+	inputArgs[0] = *setStruct;
+	inputArgs[1].Kind = VALUE_REAL;
+	inputArgs[1].Real = hash;
+	inputArgs[2] = *setVal;
+	structSetFromHashFunc(&Result, Self, nullptr, 3, inputArgs);
 }
 
 # define M_PI           3.14159265358979323846
@@ -200,9 +236,8 @@ struct BoundingBox
 static std::unordered_map<int, BoundingBox> previousFrameBoundingBoxMap;
 static std::unordered_map<int, int> bucketGridMap;
 
-static int enemyVarIndexMap[1001];
-static int baseMobVarIndexMap[1001];
-static int attackIndexMap[1001];
+static int GMLVarIndexMapYYTKHash[1001];
+static int GMLVarIndexMapGMLHash[1001];
 
 static std::vector<std::pair<long long, int>> sortVec;
 
@@ -212,7 +247,7 @@ static std::unordered_map<int, std::function<void(YYTKCodeEvent* pCodeEvent, CIn
 
 static std::unordered_map<int, std::function<void(CInstance* Self)>> behaviourFuncTable;
 
-RefString tempVar = RefString("Test", 4, false);
+RefString tempVar = RefString("Play Modded", 11, false);
 
 static std::ofstream outFile;
 
@@ -265,9 +300,9 @@ using initializeVariablesFunctionPtr = void (*)(CInstance* Self);
 
 RValue* invincibleRef = nullptr;
 
-YYRValue* RunStructFunctions(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args, setFuncParamFunctionPtr setFuncParams, initializeVariablesFunctionPtr initializeVariables, int numParams, int structIndex, int returnArgIndex, bool& isFastExit)
+YYRValue* RunStructFunctions(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args, setFuncParamFunctionPtr setFuncParams, initializeVariablesFunctionPtr initializeVariables, int numParams, VariableNames structIndex, int returnArgIndex, bool& isFastExit)
 {
-	int StructHash = baseMobVarIndexMap[structIndex];
+	int StructHash = GMLVarIndexMapYYTKHash[structIndex];
 	RValue* StructRef = nullptr;
 
 	Self->m_yyvarsMap->FindElement(StructHash, StructRef);
@@ -275,10 +310,13 @@ YYRValue* RunStructFunctions(CInstance* Self, CInstance* Other, YYRValue* Return
 
 	if (Struct->m_yyvarsMap == nullptr || Struct->m_yyvarsMap->m_numUsed == 0)
 	{
-		ReturnValue->Kind = Args[returnArgIndex]->Kind;
-		ReturnValue->Real = Args[returnArgIndex]->Real;
 		isFastExit = true;
-		return Args[returnArgIndex];
+		if (ReturnValue != nullptr)
+		{
+			ReturnValue->Kind = Args[returnArgIndex]->Kind;
+			ReturnValue->Real = Args[returnArgIndex]->Real;
+		}
+		return ReturnValue;
 	}
 
 	if (initializeVariables != nullptr)
@@ -286,7 +324,7 @@ YYRValue* RunStructFunctions(CInstance* Self, CInstance* Other, YYRValue* Return
 		initializeVariables(Self);
 	}
 
-	int baseMobArrHash = baseMobVarIndexMap[1000];
+	int baseMobArrHash = GMLVarIndexMapYYTKHash[GML_debuffDisplay];
 	RValue* baseMobArrRef = nullptr;
 	Self->m_yyvarsMap->FindElement(baseMobArrHash, baseMobArrRef);
 	RValue* prevRefArr = baseMobArrRef->RefArray->m_Array;
@@ -314,7 +352,10 @@ YYRValue* RunStructFunctions(CInstance* Self, CInstance* Other, YYRValue* Return
 			setFuncParams(paramArr, Args, Self);
 
 			scriptExecuteFunc(&returnValue, Self, Other, 4, scriptExecuteArgsArray);
-			Args[returnArgIndex]->Real = returnValue.Real;
+			if (ReturnValue != nullptr)
+			{
+				Args[returnArgIndex]->Real = returnValue.Real;
+			}
 		}
 	}
 	baseMobArrRef->RefArray->m_Array = prevRefArr;
@@ -322,9 +363,12 @@ YYRValue* RunStructFunctions(CInstance* Self, CInstance* Other, YYRValue* Return
 	curFuncParamDepth--;
 
 	isFastExit = false;
-	ReturnValue->Kind = Args[returnArgIndex]->Kind;
-	ReturnValue->Real = Args[returnArgIndex]->Real;
-	return Args[returnArgIndex];
+	if (ReturnValue != nullptr)
+	{
+		ReturnValue->Kind = Args[returnArgIndex]->Kind;
+		ReturnValue->Real = Args[returnArgIndex]->Real;
+	}
+	return ReturnValue;
 }
 
 ScriptFunc origOnTakeDamageScript = nullptr;
@@ -346,12 +390,12 @@ YYRValue* OnTakeDamageFuncDetour(CInstance* Self, CInstance* Other, YYRValue* Re
 	};
 
 	auto initializeVariables = [](CInstance* Self) {
-		int invincibleHash = baseMobVarIndexMap[6];
+		int invincibleHash = GMLVarIndexMapYYTKHash[GML_invincible];
 		Self->m_yyvarsMap->FindElement(invincibleHash, invincibleRef);
 	};
 
 	int numParams = 6;
-	int structIndex = 3;
+	VariableNames structIndex = GML_onTakeDamage;
 	int returnArgIndex = 0;
 	bool isFastExit = false;
 
@@ -401,19 +445,19 @@ YYRValue* ApplyOnHitEffectsFuncDetour(CInstance* Self, CInstance* Other, YYRValu
 	}
 
 	RValue* isEnemyPtr = nullptr;
-	int isEnemyHash = attackIndexMap[0];
+	int isEnemyHash = GMLVarIndexMapYYTKHash[GML_isEnemy];
 	curHitTargetAttackInstance->m_yyvarsMap->FindElement(isEnemyHash, isEnemyPtr);
 	RValue* creatorPtr = nullptr;
-	int creatorHash = attackIndexMap[1];
+	int creatorHash = GMLVarIndexMapYYTKHash[GML_creator];
 	curHitTargetAttackInstance->m_yyvarsMap->FindElement(creatorHash, creatorPtr);
 	RValue* onHitEffectsPtr = nullptr;
-	int onHitEffectsHash = attackIndexMap[3];
+	int onHitEffectsHash = GMLVarIndexMapYYTKHash[GML_onHitEffects];
 	curHitTargetAttackInstance->m_yyvarsMap->FindElement(onHitEffectsHash, onHitEffectsPtr);
 
 	RValue* creatorOnHitEffectsPtr = nullptr;
 	if (isEnemyPtr == nullptr || (creatorPtr != nullptr && isEnemyPtr->Real != 0))
 	{
-		creatorPtr->Object->m_yyvarsMap->FindElement(attackIndexMap[3], creatorOnHitEffectsPtr);
+		creatorPtr->Object->m_yyvarsMap->FindElement(GMLVarIndexMapYYTKHash[GML_onHitEffects], creatorOnHitEffectsPtr);
 	}
 
 	if (onHitEffectsPtr == nullptr)
@@ -479,7 +523,7 @@ YYRValue* ApplyOnHitEffectsFuncDetour(CInstance* Self, CInstance* Other, YYRValu
 		return Args[0];
 	}
 
-	int baseMobArrHash = baseMobVarIndexMap[1000];
+	int baseMobArrHash = GMLVarIndexMapYYTKHash[GML_debuffDisplay];
 	RValue* baseMobArrRef = nullptr;
 	Self->m_yyvarsMap->FindElement(baseMobArrHash, baseMobArrRef);
 	RValue* prevRefArr = baseMobArrRef->RefArray->m_Array;
@@ -528,7 +572,7 @@ YYRValue* ApplyOnHitEffectsFuncDetour(CInstance* Self, CInstance* Other, YYRValu
 TRoutine origDSMapSetScript = nullptr;
 void DSMapSetDetour(RValue* Result, CInstance* Self, CInstance* Other, int numArgs, RValue* Args)
 {
-	int StructHash = attackIndexMap[2];
+	int StructHash = GMLVarIndexMapYYTKHash[GML_OnHitEffects];
 	RValue* StructRef = nullptr;
 	globalInstancePtr->m_yyvarsMap->FindElement(StructHash, StructRef);
 	if (abs(Args[0].Real - StructRef->Real) < 1e-3)
@@ -558,7 +602,7 @@ YYRValue* ApplyKnockbackFuncDetour(CInstance* Self, CInstance* Other, YYRValue* 
 	}
 
 	RValue* knockbackPtr = nullptr;
-	int knockbackHash = attackIndexMap[5];
+	int knockbackHash = GMLVarIndexMapYYTKHash[GML_knockback];
 	curHitTargetAttackInstance->m_yyvarsMap->FindElement(knockbackHash, knockbackPtr);
 
 	if (knockbackPtr == nullptr || knockbackPtr->Object->m_yyvarsMap == nullptr)
@@ -568,7 +612,7 @@ YYRValue* ApplyKnockbackFuncDetour(CInstance* Self, CInstance* Other, YYRValue* 
 	}
 
 	RValue* durationPtr = nullptr;
-	int durationHash = attackIndexMap[6];
+	int durationHash = GMLVarIndexMapYYTKHash[GML_duration];
 	knockbackPtr->Object->m_yyvarsMap->FindElement(durationHash, durationPtr);
 
 	if (durationPtr == nullptr)
@@ -578,7 +622,7 @@ YYRValue* ApplyKnockbackFuncDetour(CInstance* Self, CInstance* Other, YYRValue* 
 	}
 
 	RValue* isKnockbackPtr = nullptr;
-	int isKnockbackHash = attackIndexMap[7];
+	int isKnockbackHash = GMLVarIndexMapYYTKHash[GML_isKnockback];
 	Self->m_yyvarsMap->FindElement(isKnockbackHash, isKnockbackPtr);
 	RValue* isKnockbackDurationPtr = nullptr;
 	isKnockbackPtr->Object->m_yyvarsMap->FindElement(durationHash, isKnockbackDurationPtr);
@@ -589,7 +633,7 @@ YYRValue* ApplyKnockbackFuncDetour(CInstance* Self, CInstance* Other, YYRValue* 
 	}
 
 	RValue* knockbackImmunePtr = nullptr;
-	int knockbackImmuneHash = attackIndexMap[8];
+	int knockbackImmuneHash = GMLVarIndexMapYYTKHash[GML_knockbackImmune];
 	Self->m_yyvarsMap->FindElement(knockbackImmuneHash, knockbackImmunePtr);
 	if (knockbackImmunePtr == nullptr || knockbackImmunePtr->Real != 0)
 	{
@@ -619,17 +663,17 @@ YYRValue* ApplyStatusEffectsFuncDetour(CInstance* Self, CInstance* Other, YYRVal
 	}
 
 	RValue* isEnemyPtr = nullptr;
-	int isEnemyHash = attackIndexMap[0];
+	int isEnemyHash = GMLVarIndexMapYYTKHash[GML_isEnemy];
 	curHitTargetAttackInstance->m_yyvarsMap->FindElement(isEnemyHash, isEnemyPtr);
 
 	int statusEffectsLength = 0;
 	if (isEnemyPtr == nullptr)
 	{
 		RValue* creatorPtr = nullptr;
-		int creatorHash = attackIndexMap[1];
+		int creatorHash = GMLVarIndexMapYYTKHash[GML_creator];
 		curHitTargetAttackInstance->m_yyvarsMap->FindElement(creatorHash, creatorPtr);
 		RValue* creatorStatusEffects = nullptr;
-		int statusEffectsHash = attackIndexMap[4];
+		int statusEffectsHash = GMLVarIndexMapYYTKHash[GML_statusEffects];
 		creatorPtr->Object->m_yyvarsMap->FindElement(statusEffectsHash, creatorStatusEffects);
 		RValue* statusEffects = nullptr;
 		curHitTargetAttackInstance->m_yyvarsMap->FindElement(statusEffectsHash, statusEffects);
@@ -645,7 +689,7 @@ YYRValue* ApplyStatusEffectsFuncDetour(CInstance* Self, CInstance* Other, YYRVal
 	else
 	{
 		RValue* statusEffects = nullptr;
-		int statusEffectsHash = attackIndexMap[4];
+		int statusEffectsHash = GMLVarIndexMapYYTKHash[GML_statusEffects];
 		curHitTargetAttackInstance->m_yyvarsMap->FindElement(statusEffectsHash, statusEffects);
 		if (statusEffects->Object->m_yyvarsMap != nullptr)
 		{
@@ -683,12 +727,12 @@ YYRValue* OnTakeDamageAfterFuncDetour(CInstance* Self, CInstance* Other, YYRValu
 	};
 
 	auto initializeVariables = [](CInstance* Self) {
-		int invincibleHash = baseMobVarIndexMap[6];
+		int invincibleHash = GMLVarIndexMapYYTKHash[GML_invincible];
 		Self->m_yyvarsMap->FindElement(invincibleHash, invincibleRef);
 	};
 
 	int numParams = 6;
-	int structIndex = 4;
+	VariableNames structIndex = GML_onTakeDamageAfter;
 	int returnArgIndex = 0;
 	bool isFastExit = false;
 
@@ -722,7 +766,7 @@ YYRValue* OnDodgeFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnV
 	};
 
 	int numParams = 4;
-	int structIndex = 5;
+	VariableNames structIndex = GML_onDodge;
 	int returnArgIndex = 0;
 	bool isFastExit = false;
 
@@ -749,11 +793,9 @@ static bool isInApplyDamageFunc = false;
 YYRValue* ApplyDamageFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
 	isInApplyDamageFunc = true;
-	auto start = std::chrono::high_resolution_clock::now();
+	long long startTime = StartProfilerTime();
 	YYRValue* res = origApplyDamageScript(Self, Other, ReturnValue, numArgs, Args);
-	auto end = std::chrono::high_resolution_clock::now();
-	applyDamageFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-	applyDamageNumTimes++;
+	EndProfilerTime(startTime, MICROSECONDS, applyDamageFuncTime, applyDamageNumTimes);
 	isInApplyDamageFunc = false;
 	return res;
 };
@@ -767,32 +809,26 @@ static int numDamageText = 0;
 
 YYRValue* HitNumberFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
-	auto start = std::chrono::high_resolution_clock::now();
+	long long startTime = StartProfilerTime();
 	RValue* showDamageTextPtr = nullptr;
-	int showDamageTextHash = attackIndexMap[9];
+	int showDamageTextHash = GMLVarIndexMapYYTKHash[GML_showDamageText];
 	globalInstancePtr->m_yyvarsMap->FindElement(showDamageTextHash, showDamageTextPtr);
 	if (showDamageTextPtr->Real == 0)
 	{
-		auto end = std::chrono::high_resolution_clock::now();
-		hitNumberFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-		hitNumberNumTimes++;
+		EndProfilerTime(startTime, NANOSECONDS, hitNumberFuncTime, hitNumberNumTimes);
 		return nullptr;
 	}
 
 	if (numDamageText >= 100)
 	{
-		auto end = std::chrono::high_resolution_clock::now();
-		hitNumberFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-		hitNumberNumTimes++;
+		EndProfilerTime(startTime, NANOSECONDS, hitNumberFuncTime, hitNumberNumTimes);
 		return nullptr;
 	}
 
 	bool prevIsInApplyDamageFunc = isInApplyDamageFunc;
 	isInApplyDamageFunc = false;
 	YYRValue* res = origHitNumberScript(Self, Other, ReturnValue, numArgs, Args);
-	auto end = std::chrono::high_resolution_clock::now();
-	hitNumberFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-	hitNumberNumTimes++;
+	EndProfilerTime(startTime, NANOSECONDS, hitNumberFuncTime, hitNumberNumTimes);
 	isInApplyDamageFunc = prevIsInApplyDamageFunc;
 	return res;
 };
@@ -805,11 +841,9 @@ YYRValue* OnKillingHitFuncDetour(CInstance* Self, CInstance* Other, YYRValue* Re
 {
 	bool prevIsInApplyDamageFunc = isInApplyDamageFunc;
 	isInApplyDamageFunc = false;
-	auto start = std::chrono::high_resolution_clock::now();
+	long long startTime = StartProfilerTime();
 	YYRValue* res = origOnKillingHitScript(Self, Other, ReturnValue, numArgs, Args);
-	auto end = std::chrono::high_resolution_clock::now();
-	onKillingHitFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-	onKillingHitNumTimes++;
+	EndProfilerTime(startTime, NANOSECONDS, onKillingHitFuncTime, onKillingHitNumTimes);
 	isInApplyDamageFunc = prevIsInApplyDamageFunc;
 	return res;
 };
@@ -831,11 +865,9 @@ YYRValue* SoundPlayFuncDetour(CInstance* Self, CInstance* Other, YYRValue* Retur
 {
 	bool prevIsInApplyDamageFunc = isInApplyDamageFunc;
 	isInApplyDamageFunc = false;
-	auto start = std::chrono::high_resolution_clock::now();
+	long long startTime = StartProfilerTime();
 	YYRValue* res = origSoundPlayScript(Self, Other, ReturnValue, numArgs, Args);
-	auto end = std::chrono::high_resolution_clock::now();
-	soundPlayFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-	soundPlayNumTimes++;
+	EndProfilerTime(startTime, NANOSECONDS, soundPlayFuncTime, soundPlayNumTimes);
 	isInApplyDamageFunc = prevIsInApplyDamageFunc;
 	return res;
 };
@@ -848,11 +880,9 @@ YYRValue* ApplyHitEffectFuncDetour(CInstance* Self, CInstance* Other, YYRValue* 
 {
 	bool prevIsInApplyDamageFunc = isInApplyDamageFunc;
 	isInApplyDamageFunc = false;
-	auto start = std::chrono::high_resolution_clock::now();
+	long long startTime = StartProfilerTime();
 	YYRValue* res = origApplyHitEffectScript(Self, Other, ReturnValue, numArgs, Args);
-	auto end = std::chrono::high_resolution_clock::now();
-	applyHitEffectFuncTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-	applyHitEffectNumTimes++;
+	EndProfilerTime(startTime, NANOSECONDS, applyHitEffectFuncTime, applyHitEffectNumTimes);
 	isInApplyDamageFunc = prevIsInApplyDamageFunc;
 	return res;
 };
@@ -868,11 +898,9 @@ YYRValue* DieFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue
 	bool prevIsInApplyDamageFunc = isInApplyDamageFunc;
 	isInApplyDamageFunc = false;
 	isInDieFunc = true;
-	auto start = std::chrono::high_resolution_clock::now();
+	long long startTime = StartProfilerTime();
 	YYRValue* res = origDieScript(Self, Other, ReturnValue, numArgs, Args);
-	auto end = std::chrono::high_resolution_clock::now();
-	dieFuncTime += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-	dieNumTimes++;
+	EndProfilerTime(startTime, MICROSECONDS, dieFuncTime, dieNumTimes);
 	isInDieFunc = false;
 	isInApplyDamageFunc = prevIsInApplyDamageFunc;
 	return res;
@@ -882,7 +910,6 @@ ScriptFunc origTakeDamageScript = nullptr;
 static long long takeDamageFuncTime = 0;
 static int takeDamageNumTimes = 0;
 
-std::chrono::steady_clock::time_point takeDamageStartTime;
 YYRValue* takeDamageFuncArgs[9];
 
 YYRValue* TakeDamageFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
@@ -894,7 +921,7 @@ YYRValue* TakeDamageFuncDetour(CInstance* Self, CInstance* Other, YYRValue* Retu
 	}
 	bool prevIsInHitTarget = isInHitTarget;
 	isInHitTarget = false;
-	auto start = std::chrono::high_resolution_clock::now();
+	long long startTime = StartProfilerTime();
 	YYRValue* res = nullptr;
 	if (numArgs < 9)
 	{
@@ -919,9 +946,7 @@ YYRValue* TakeDamageFuncDetour(CInstance* Self, CInstance* Other, YYRValue* Retu
 	{
 		res = origTakeDamageScript(Self, Other, ReturnValue, 9, Args);
 	}
-	auto end = std::chrono::high_resolution_clock::now();
-	takeDamageFuncTime += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-	takeDamageNumTimes++;
+	EndProfilerTime(startTime, MICROSECONDS, takeDamageFuncTime, takeDamageNumTimes);
 	isInHitTarget = prevIsInHitTarget;
 	curHitTargetAttackInstance = prevCurHitTargetAttackInstance;
 	return res;
@@ -960,15 +985,13 @@ YYRValue* CalculateDamageFuncDetour(CInstance* Self, CInstance* Other, YYRValue*
 	bool prevIsInHitTarget = isInHitTarget;
 	isInHitTarget = false;
 	isInCalculateDamage = true;
-	auto start = std::chrono::high_resolution_clock::now();
+	long long startTime = StartProfilerTime();
 	YYRValue* res = nullptr;
 	//	for (int i = 0; i < 10000; i++)
 	{
 		res = origCalculateDamageScript(Self, Other, ReturnValue, numArgs, Args);
 	}
-	auto end = std::chrono::high_resolution_clock::now();
-	calculateDamageFuncTime += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-	calculateDamageNumTimes++;
+	EndProfilerTime(startTime, MICROSECONDS, calculateDamageFuncTime, calculateDamageNumTimes);
 	isInCalculateDamage = false;
 	isInHitTarget = prevIsInHitTarget;
 	return res;
@@ -988,15 +1011,13 @@ YYRValue* HitTargetFuncDetour(CInstance* Self, CInstance* Other, YYRValue* Retur
 	hitTargetIndex = Args[0]->Object->m_slot;
 	YYRValue ResOne;
 	isInHitTarget = true;
-	auto start = std::chrono::high_resolution_clock::now();
+	long long startTime = StartProfilerTime();
 	YYRValue* res = nullptr;
 	//	for (int i = 0; i < 100000; i++)
 	{
 		res = origHitTargetScript(Self, Other, ReturnValue, numArgs, Args);
 	}
-	auto end = std::chrono::high_resolution_clock::now();
-	hitTargetFuncTime += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-	hitTargetNumTimes++;
+	EndProfilerTime(startTime, MICROSECONDS, hitTargetFuncTime, hitTargetNumTimes);
 	isInHitTarget = false;
 	curHitTargetAttackInstance = prevCurHitTargetAttackInstance;
 	return res;
@@ -1027,18 +1048,23 @@ void VariableStructExistsDetour(RValue* Result, CInstance* Self, CInstance* Othe
 {
 	if (isInHitTarget)
 	{
-		Result->Kind = VALUE_REAL;
-		std::unordered_map<int, uint32_t>& hitEnemyFrameNumberMap = attackHitEnemyFrameNumberMap[Self->i_id];
-		if (hitEnemyFrameNumberMap.count(hitTargetIndex) == 0 || hitEnemyFrameNumberMap[hitTargetIndex] + attackHitCooldownMap[Self->i_spriteindex] <= FrameNumber)
+		int enemiesInvincMapHash = GMLVarIndexMapYYTKHash[GML_enemiesInvincMap];
+		RValue* enemiesInvincMapPtr = nullptr;
+		if (Self->m_yyvarsMap->FindElement(enemiesInvincMapHash, enemiesInvincMapPtr) && enemiesInvincMapPtr->Pointer == Args[0].Pointer)
 		{
-			Result->Real = 0;
-			hitEnemyFrameNumberMap[hitTargetIndex] = FrameNumber;
+			Result->Kind = VALUE_REAL;
+			std::unordered_map<int, uint32_t>& hitEnemyFrameNumberMap = attackHitEnemyFrameNumberMap[Self->i_id];
+			if (hitEnemyFrameNumberMap.count(hitTargetIndex) == 0 || hitEnemyFrameNumberMap[hitTargetIndex] + attackHitCooldownMap[Self->i_spriteindex] <= FrameNumber)
+			{
+				Result->Real = 0;
+				hitEnemyFrameNumberMap[hitTargetIndex] = FrameNumber;
+			}
+			else
+			{
+				Result->Real = 1;
+			}
+			return;
 		}
-		else
-		{
-			Result->Real = 1;
-		}
-		return;
 	}
 	//For some reason, the second argument can be a real number
 	if (Args[0].Kind == VALUE_OBJECT && Args[1].Kind == VALUE_STRING)
@@ -1095,6 +1121,14 @@ void StringDetour(RValue* Result, CInstance* Self, CInstance* Other, int numArgs
 }
 
 TRoutine origArrayLengthScript = nullptr;
+static long long behaviourFuncTime = 0;
+static int behaviourNumTimes = 0;
+static long long behaviourCollideWithPlayerFuncTime = 0;
+static int behaviourCollideWithPlayerNumTimes = 0;
+static long long behaviourFollowPlayerFuncTime = 0;
+static int behaviourFollowPlayerNumTimes = 0;
+static long long behaviourPowerScalingFuncTime = 0;
+static int behaviourPowerScalingNumTimes = 0;
 void ArrayLengthDetour(RValue* Result, CInstance* Self, CInstance* Other, int numArgs, RValue* Args)
 {
 	if (Args[0].Kind == VALUE_UNSET)
@@ -1102,6 +1136,127 @@ void ArrayLengthDetour(RValue* Result, CInstance* Self, CInstance* Other, int nu
 		Result->Kind = VALUE_REAL;
 		Result->Real = 0;
 		return;
+	}
+	if (Self->i_objectindex == objEnemyIndex)
+	{
+		auto selfMap = Self->m_yyvarsMap;
+		int behaviourKeysHash = GMLVarIndexMapYYTKHash[GML_behaviourKeys];
+		RValue* behaviourKeysPtr = nullptr;
+		selfMap->FindElement(behaviourKeysHash, behaviourKeysPtr);
+		if (behaviourKeysPtr->Pointer == Args[0].Pointer)
+		{
+			{
+				int behavioursHash = GMLVarIndexMapYYTKHash[GML_behaviours];
+				RValue* behavioursPtr = nullptr;
+				selfMap->FindElement(behavioursHash, behavioursPtr);
+				auto behavioursMap = behavioursPtr->Object->m_yyvarsMap;
+
+				if (behavioursMap != nullptr && behavioursMap->m_numUsed != 0)
+				{
+					int baseMobArrHash = GMLVarIndexMapYYTKHash[GML_debuffDisplay];
+					RValue* baseMobArrRef = nullptr;
+					selfMap->FindElement(baseMobArrHash, baseMobArrRef);
+					RValue* prevRefArr = baseMobArrRef->RefArray->m_Array;
+					int prevRefArrLength = baseMobArrRef->RefArray->length;
+					RValue* paramArr = baseMobArrRef->RefArray->m_Array = curFuncParamArr[curFuncParamDepth];
+					baseMobArrRef->RefArray->length = 10;
+					curFuncParamDepth++;
+
+					scriptExecuteArgsArray[1].Kind = VALUE_ARRAY;
+					scriptExecuteArgsArray[1].RefArray = baseMobArrRef->RefArray;
+					scriptExecuteArgsArray[2].Kind = VALUE_REAL;
+					scriptExecuteArgsArray[2].Real = 0;
+					scriptExecuteArgsArray[3].Kind = VALUE_REAL;
+					scriptExecuteArgsArray[3].Real = 2;
+
+					paramArr[0].Kind = VALUE_OBJECT;
+					paramArr[0].Instance = Self;
+
+					RValue returnValue;
+					int curSize = behavioursMap->m_curSize;
+					for (int i = 0; i < curSize; i++)
+					{
+						auto curElement = &(behavioursMap->m_pBuckets[i]);
+						int curHash = curElement->Hash;
+						if (curHash != 0 && curHash != GMLVarIndexMapYYTKHash[GML_powerScaling])
+						{
+							if (curHash == GMLVarIndexMapYYTKHash[GML_followPlayer])
+							{
+								RValue* canMovePtr = nullptr;
+								RValue* dontMovePtr = nullptr;
+								selfMap->FindElement(GMLVarIndexMapYYTKHash[GML_canMove], canMovePtr);
+								selfMap->FindElement(GMLVarIndexMapYYTKHash[GML_dontMove], dontMovePtr);
+								if (static_cast<int>(canMovePtr->Real) != 0 && static_cast<int>(dontMovePtr->Real) == 0)
+								{
+									RValue setStruct;
+									setStruct.Kind = VALUE_OBJECT;
+									setStruct.Instance = Self;
+									RValue setVal;
+									setVal.Kind = VALUE_REAL;
+									setVal.Real = 1;
+									StructSetFromHash(Self, &setStruct, GMLVarIndexMapGMLHash[GML_normalMovement], &setVal);
+									if (currentPlayer.gmlInstance.xPos > Self->i_x)
+									{
+										Self->i_imagescalex = abs(Self->i_imagescalex);
+									}
+									else
+									{
+										Self->i_imagescalex = -abs(Self->i_imagescalex);
+									}
+									RValue* SPDPtr = nullptr;
+									selfMap->FindElement(GMLVarIndexMapYYTKHash[GML_SPD], SPDPtr);
+									RValue* directionMovingPtr = nullptr;
+									selfMap->FindElement(GMLVarIndexMapYYTKHash[GML_directionMoving], directionMovingPtr);
+									RValue* directionChangeTimePtr = nullptr;
+									selfMap->FindElement(GMLVarIndexMapYYTKHash[GML_directionChangeTime], directionChangeTimePtr);
+									double curDirectionAngle = directionMovingPtr->Real;
+									if (static_cast<int>(directionChangeTimePtr->Real) == 0)
+									{
+										curDirectionAngle = 180.0 / M_PI * atan2(currentPlayer.gmlInstance.yPos - Self->i_y, currentPlayer.gmlInstance.xPos - Self->i_x);
+										if (curDirectionAngle < 0)
+										{
+											curDirectionAngle += 360;
+										}
+										directionChangeTimePtr->Real = 3;
+										StructSetFromHash(Self, &setStruct, GMLVarIndexMapGMLHash[GML_directionChangeTime], directionChangeTimePtr);
+										directionMovingPtr->Real = curDirectionAngle;
+										StructSetFromHash(Self, &setStruct, GMLVarIndexMapGMLHash[GML_directionMoving], directionMovingPtr);
+									}
+									if (curDirectionAngle >= 180)
+									{
+										curDirectionAngle -= 360;
+									}
+									double speed = SPDPtr->Real;
+									Self->i_x += cos(curDirectionAngle * M_PI / 180.0) * speed;
+									setVal.Real = Self->i_y + sin(curDirectionAngle * M_PI / 180.0) * speed;
+									StructSetFromHash(Self, &setStruct, GMLVarIndexMapGMLHash[GML_y], &setVal);
+								}
+							}
+							else
+							{
+								RValue* behaviourPtr = curElement->v;
+								RValue* ScriptPtr = nullptr;
+								RValue* configPtr = nullptr;
+
+								auto behaviourPtrMap = behaviourPtr->Object->m_yyvarsMap;
+								behaviourPtrMap->FindElement(GMLVarIndexMapYYTKHash[GML_Script], ScriptPtr);
+								behaviourPtrMap->FindElement(GMLVarIndexMapYYTKHash[GML_config], configPtr);
+
+								scriptExecuteArgsArray[0] = *ScriptPtr;
+								paramArr[1] = *configPtr;
+								scriptExecuteFunc(&returnValue, Self, Other, 4, scriptExecuteArgsArray);
+							}
+						}
+					}
+					baseMobArrRef->RefArray->m_Array = prevRefArr;
+					baseMobArrRef->RefArray->length = prevRefArrLength;
+					curFuncParamDepth--;
+				}
+			}
+			Result->Kind = VALUE_REAL;
+			Result->Real = 0;
+			return;
+		}
 	}
 	origArrayLengthScript(Result, Self, Other, numArgs, Args);
 }
@@ -1153,7 +1308,7 @@ YYRValue* OnCriticalHitFuncDetour(CInstance* Self, CInstance* Other, YYRValue* R
 	};
 
 	int numParams = 4;
-	int structIndex = 2;
+	VariableNames structIndex = GML_onCriticalHit;
 	int returnArgIndex = 2;
 	bool isFastExit = false;
 
@@ -1188,7 +1343,7 @@ YYRValue* AfterCriticalHitFuncDetour(CInstance* Self, CInstance* Other, YYRValue
 	};
 
 	int numParams = 4;
-	int structIndex = 1;
+	VariableNames structIndex = GML_afterCriticalHit;
 	int returnArgIndex = 2;
 	bool isFastExit = false;
 
@@ -1221,7 +1376,7 @@ YYRValue* BeforeDamageCalculationFuncDetour(CInstance* Self, CInstance* Other, Y
 	};
 
 	int numParams = 4;
-	int structIndex = 0;
+	VariableNames structIndex = GML_beforeDamageCalculation;
 	int returnArgIndex = 2;
 	bool isFastExit = false;
 
@@ -1245,11 +1400,9 @@ static int dropEXPNumTimes = 0;
 
 YYRValue* DropEXPFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
-	auto start = std::chrono::high_resolution_clock::now();
+	long long startTime = StartProfilerTime();
 	YYRValue* res = origDropEXPScript(Self, Other, ReturnValue, numArgs, Args);
-	auto end = std::chrono::high_resolution_clock::now();
-	dropEXPFuncTime += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-	dropEXPNumTimes++;
+	EndProfilerTime(startTime, MICROSECONDS, dropEXPFuncTime, dropEXPNumTimes);
 	return res;
 };
 
@@ -1262,17 +1415,14 @@ static bool isInSpawnMobFunc = false;
 YYRValue* SpawnMobFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
 {
 	isInSpawnMobFunc = true;
-	auto start = std::chrono::high_resolution_clock::now();
+	long long startTime = StartProfilerTime();
 	YYRValue* res = origSpawnMobScript(Self, Other, ReturnValue, numArgs, Args);
-	auto end = std::chrono::high_resolution_clock::now();
-	spawnMobFuncTime += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-	spawnMobNumTimes++;
+	EndProfilerTime(startTime, MICROSECONDS, spawnMobFuncTime, spawnMobNumTimes);
 	isInSpawnMobFunc = false;
 	return res;
 };
 
 TRoutine variableCloneFunc = nullptr;
-TRoutine structSetFromHashFunc = nullptr;
 TRoutine arrayCreateFunc = nullptr;
 YYObjectBase* curStructPtr = nullptr;
 
@@ -1285,17 +1435,6 @@ void CreateEmptyStruct(CInstance* Self, YYObjectBase* structPtr, RValue* copyToR
 	structPtr->m_yyvarsMap = nullptr;
 	variableCloneFunc(copyToRValue, Self, nullptr, 1, inputArg);
 	structPtr->m_yyvarsMap = prevMap;
-}
-
-void StructSetFromHash(CInstance* Self, RValue* setStruct, int hash, RValue* setVal)
-{
-	RValue Result;
-	RValue inputArgs[3];
-	inputArgs[0] = *setStruct;
-	inputArgs[1].Kind = VALUE_REAL;
-	inputArgs[1].Real = hash;
-	inputArgs[2] = *setVal;
-	structSetFromHashFunc(&Result, Self, nullptr, 3, inputArgs);
 }
 
 void DeepStructCopy(CInstance* Self, RValue* copyFromObject, RValue* copyToObject)
@@ -1330,7 +1469,7 @@ void DeepStructCopy(CInstance* Self, RValue* copyFromObject, RValue* copyToObjec
 					arrayCreateFunc(&newArray, Self, nullptr, 1, inputArg);
 					DeepStructCopy(Self, curRValue, &newArray);
 					StructSetFromHash(Self, copyToObject, copyFromMap->m_pBuckets[i].k, &newArray);
-					
+
 				}
 				else
 				{
@@ -1346,7 +1485,7 @@ void DeepStructCopy(CInstance* Self, RValue* copyFromObject, RValue* copyToObjec
 		for (int i = 0; i < copyFromArr->length; i++)
 		{
 			auto curRValue = copyFromArr->m_Array[i];
-			
+
 			if (curRValue.Kind == VALUE_OBJECT && curRValue.Object->m_kind == 0)
 			{
 				RValue newStruct;
@@ -1394,11 +1533,9 @@ YYRValue* ActualSpawnMobFuncDetour(CInstance* Self, CInstance* Other, YYRValue* 
 	bool prevIsInSpawnMobFunc = isInSpawnMobFunc;
 	isInSpawnMobFunc = false;
 	isInActualSpawnMobFunc = true;
-	auto start = std::chrono::high_resolution_clock::now();
+	long long startTime = StartProfilerTime();
 	YYRValue* res = origActualSpawnMobScript(Self, Other, ReturnValue, numArgs, Args);
-	auto end = std::chrono::high_resolution_clock::now();
-	acutalSpawnMobFuncTime += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-	actualSpawnMobNumTimes++;
+	EndProfilerTime(startTime, MICROSECONDS, acutalSpawnMobFuncTime, actualSpawnMobNumTimes);
 	isInActualSpawnMobFunc = false;
 	isInSpawnMobFunc = prevIsInSpawnMobFunc;
 	return res;
@@ -1411,22 +1548,18 @@ YYRValue* VariableStructCopyFuncDetour(CInstance* Self, CInstance* Other, YYRVal
 {
 	if (Args[0]->Kind == VALUE_OBJECT)
 	{
-		auto start = std::chrono::high_resolution_clock::now();
+		long long startTime = StartProfilerTime();
 		curStructPtr = Args[0]->Object;
-		
+
 		DeepStructCopy(Self, (RValue*)Args[0], (RValue*)Args[1]);
-		
+
 		curStructPtr = nullptr;
-		auto end = std::chrono::high_resolution_clock::now();
-		variableStructCopyFuncTime += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-		variableStructCopyNumTimes++;
+		EndProfilerTime(startTime, MICROSECONDS, variableStructCopyFuncTime, variableStructCopyNumTimes);
 		return Args[1];
 	}
-	auto start = std::chrono::high_resolution_clock::now();
+	long long startTime = StartProfilerTime();
 	YYRValue* res = origVariableStructCopyScript(Self, Other, ReturnValue, numArgs, Args);
-	auto end = std::chrono::high_resolution_clock::now();
-	variableStructCopyFuncTime += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-	variableStructCopyNumTimes++;
+	EndProfilerTime(startTime, MICROSECONDS, variableStructCopyFuncTime, variableStructCopyNumTimes);
 	return res;
 };
 
@@ -1442,6 +1575,8 @@ void InstanceCreateLayerDetour(RValue* Result, CInstance* Self, CInstance* Other
 	}
 }
 
+static bool isInExecuteAttack = false;
+
 TRoutine origVariableInstanceGetNamesScript = nullptr;
 void VariableInstanceGetNamesDetour(RValue* Result, CInstance* Self, CInstance* Other, int numArgs, RValue* Args)
 {
@@ -1452,7 +1587,7 @@ void VariableInstanceGetNamesDetour(RValue* Result, CInstance* Self, CInstance* 
 	}
 	if (isInSpawnMobFunc || isInActualSpawnMobFunc)
 	{
-		int spriteIndexHash = baseMobVarIndexMap[7];
+		int spriteIndexHash = GMLVarIndexMapYYTKHash[GML_sprite_index];
 		RValue* spriteIndexPtr = nullptr;
 		if (Args[0].Object->m_yyvarsMap->FindElement(spriteIndexHash, spriteIndexPtr))
 		{
@@ -1468,17 +1603,86 @@ void VariableInstanceGetNamesDetour(RValue* Result, CInstance* Self, CInstance* 
 				setStruct.Pointer = curMob;
 			}
 			auto configMap = Args[0].Object->m_yyvarsMap;
-			for (int i = 0; i < configMap->m_curSize; i++)
+			if (configMap != nullptr)
 			{
-				int curHash = configMap->m_pBuckets[i].Hash;
-				if (curHash != 0 && curHash != spriteIndexHash)
+				int curSize = configMap->m_curSize;
+				for (int i = 0; i < curSize; i++)
 				{
-					StructSetFromHash(Self, &setStruct, configMap->m_pBuckets[i].k, configMap->m_pBuckets[i].v);
+					int curHash = configMap->m_pBuckets[i].Hash;
+					if (curHash != 0 && curHash != spriteIndexHash)
+					{
+						StructSetFromHash(Self, &setStruct, configMap->m_pBuckets[i].k, configMap->m_pBuckets[i].v);
+					}
 				}
 			}
 			curMob = nullptr;
 			Result->Kind = VALUE_UNSET;
 			return;
+		}
+	}
+	if (isInExecuteAttack)
+	{
+		if (Args[0].Kind == VALUE_OBJECT)
+		{
+			if (Self->i_objectindex == objPreCreateIndex)
+			{
+				RValue* setStruct = nullptr;
+				Self->m_yyvarsMap->FindElement(GMLVarIndexMapYYTKHash[GML_config], setStruct);
+				auto configMap = Args[0].Object->m_yyvarsMap;
+				if (configMap != nullptr)
+				{
+					int curSize = configMap->m_curSize;
+					for (int i = 0; i < curSize; i++)
+					{
+						int curHash = configMap->m_pBuckets[i].Hash;
+						if (curHash != 0)
+						{
+							if (curHash == GMLVarIndexMapYYTKHash[GML_StampVars])
+							{
+								RValue newStruct;
+								CreateEmptyStruct(Self, Args[0].Object, &newStruct);
+								DeepStructCopy(Self, configMap->m_pBuckets[i].v, &newStruct);
+								StructSetFromHash(Self, setStruct, configMap->m_pBuckets[i].k, &newStruct);
+							}
+							else
+							{
+								StructSetFromHash(Self, setStruct, configMap->m_pBuckets[i].k, configMap->m_pBuckets[i].v);
+							}
+						}
+					}
+				}
+				Result->Kind = VALUE_UNSET;
+				return;
+			}
+			else if (Self->i_objectindex == objAttackIndex)
+			{
+				RValue setStruct;
+				setStruct.Kind = VALUE_OBJECT;
+				setStruct.Instance = Self;
+				auto configMap = Args[0].Object->m_yyvarsMap;
+				if (configMap != nullptr)
+				{
+					int curSize = configMap->m_curSize;
+					for (int i = 0; i < curSize; i++)
+					{
+						int curHash = configMap->m_pBuckets[i].Hash;
+						if (curHash != 0)
+						{
+							StructSetFromHash(Self, &setStruct, configMap->m_pBuckets[i].k, configMap->m_pBuckets[i].v);
+						}
+					}
+				}
+				Result->Kind = VALUE_UNSET;
+				return;
+			}
+			else
+			{
+				//				PrintMessage(CLR_RED, "UNEXPECTED GET NAMES CALL %d", Self->i_objectindex);
+			}
+		}
+		else
+		{
+			//			PrintMessage(CLR_RED, "UNEXPECTED ARGS TYPE %d", Args[0].Kind);
 		}
 	}
 	origVariableInstanceGetNamesScript(Result, Self, Other, numArgs, Args);
@@ -1657,7 +1861,7 @@ void DSListSizeDetour(RValue* Result, CInstance* Self, CInstance* Other, int num
 {
 	if (isInGLRMeshDestroyAll)
 	{
-		int GLRMeshDynListHash = baseMobVarIndexMap[8];
+		int GLRMeshDynListHash = GMLVarIndexMapYYTKHash[GML_GLR_MESH_DYN_LIST];
 		RValue* GLRMeshDynListPtr = nullptr;
 		globalInstancePtr->m_yyvarsMap->FindElement(GLRMeshDynListHash, GLRMeshDynListPtr);
 		if (static_cast<int>(GLRMeshDynListPtr->Real) == static_cast<int>(Args[0].Real))
@@ -1691,7 +1895,7 @@ void DSListClearDetour(RValue* Result, CInstance* Self, CInstance* Other, int nu
 {
 	if (isInGLRMeshDestroyAll)
 	{
-		int GLRMeshDynListHash = baseMobVarIndexMap[8];
+		int GLRMeshDynListHash = GMLVarIndexMapYYTKHash[GML_GLR_MESH_DYN_LIST];
 		RValue* GLRMeshDynListPtr = nullptr;
 		globalInstancePtr->m_yyvarsMap->FindElement(GLRMeshDynListHash, GLRMeshDynListPtr);
 		if (static_cast<int>(GLRMeshDynListPtr->Real) == static_cast<int>(Args[0].Real))
@@ -1701,6 +1905,21 @@ void DSListClearDetour(RValue* Result, CInstance* Self, CInstance* Other, int nu
 	}
 	origDSListClearScript(Result, Self, Other, numArgs, Args);
 }
+
+ScriptFunc origExecuteAttackScript = nullptr;
+static long long executeAttackFuncTime = 0;
+static int executeAttackNumTimes = 0;
+
+YYRValue* ExecuteAttackFuncDetour(CInstance* Self, CInstance* Other, YYRValue* ReturnValue, int numArgs, YYRValue** Args)
+{
+	isInExecuteAttack = true;
+	long long startTime = StartProfilerTime();
+	auto start = std::chrono::high_resolution_clock::now();
+	YYRValue* Res = origExecuteAttackScript(Self, Other, ReturnValue, numArgs, Args);
+	EndProfilerTime(startTime, MICROSECONDS, executeAttackFuncTime, executeAttackNumTimes);
+	isInExecuteAttack = false;
+	return Res;
+};
 
 int hashCoords(int xPos, int yPos)
 {
@@ -1720,171 +1939,191 @@ YYTKStatus FrameCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 	FrameNumber++;
 
 	numSpawnAdditionalMesh = 20;
-
-	if (FrameNumber % 60 == 0)
+	if (ENABLEPROFILER)
 	{
-		YYRValue Result;
-		PrintMessage(CLR_DEFAULT, "Number of Enemies Alive: %d, %d, %d"
-			, NumberOfEnemiesCreated - NumberOfEnemyDeadCreated, numEnemyStepSkip, numEnemyStepCall);
-		PrintMessage(CLR_DEFAULT, "available meshes: %d", availableMeshes.size());
-		numEnemyStepSkip = 0;
-		numEnemyStepCall = 0;
-	}
-	if (totTime >= 12000)
-	{
-		sortVec.clear();
-		for (auto it = ProfilerMap.begin(); it != ProfilerMap.end(); it++)
+		if (FrameNumber % 60 == 0)
 		{
-			sortVec.push_back(std::make_pair(it->second, it->first));
+			YYRValue Result;
+			PrintMessage(CLR_DEFAULT, "Number of Enemies Alive: %d, %d, %d"
+				, NumberOfEnemiesCreated - NumberOfEnemyDeadCreated, numEnemyStepSkip, numEnemyStepCall);
+			PrintMessage(CLR_DEFAULT, "available meshes: %d", availableMeshes.size());
+			numEnemyStepSkip = 0;
+			numEnemyStepCall = 0;
 		}
-		std::sort(sortVec.begin(), sortVec.end(), std::greater<>());
-		outFile << "Frame Number: " << FrameNumber << " totTime: " << totTime << "\n";
-		if (timePtr != nullptr)
+		if (totTime >= 12000)
 		{
-			char buffer[100];
-			sprintf(buffer, "%d:%02d:%02d\n", static_cast<int>(timePtr->RefArray->m_Array[0].Real), static_cast<int>(timePtr->RefArray->m_Array[1].Real), static_cast<int>(timePtr->RefArray->m_Array[2].Real));
-			outFile << buffer;
-		}
-		if (spawnMobFuncTime > 1000)
-		{
-			outFile << "spawnMobFuncTime: " << spawnMobFuncTime << " num times: " << spawnMobNumTimes << "\n";
-			outFile << "acutalSpawnMobFuncTime: " << acutalSpawnMobFuncTime << " num times: " << actualSpawnMobNumTimes << "\n";
-			outFile << "variableStructCopyFuncTime: " << variableStructCopyFuncTime << " num times: " << variableStructCopyNumTimes << "\n";
-		}
-		if (hitTargetFuncTime > 1000)
-		{
-			outFile << "hitTargetFuncTime: " << hitTargetFuncTime << " num times: " << hitTargetNumTimes << "\n";
-			outFile << "calculateDamageFuncTime: " << calculateDamageFuncTime << " num times: " << calculateDamageNumTimes << "\n";
-			outFile << "beforeDamageCalculationFastFuncTime: " << beforeDamageCalculationFastFuncTime << " num times: " << beforeDamageCalculationFastNumTimes << "\n";
-			outFile << "beforeDamageCalculationSlowFuncTime: " << beforeDamageCalculationSlowFuncTime << " num times: " << beforeDamageCalculationSlowNumTimes << "\n";
-			outFile << "onCriticalHitFastFuncTime: " << onCriticalHitFastFuncTime << " num times: " << onCriticalHitFastNumTimes << "\n";
-			outFile << "onCriticalHitSlowFuncTime: " << onCriticalHitSlowFuncTime << " num times: " << onCriticalHitSlowNumTimes << "\n";
-			outFile << "afterCriticalHitFastFuncTime: " << afterCriticalHitFastFuncTime << " num times: " << afterCriticalHitFastNumTimes << "\n";
-			outFile << "afterCriticalHitSlowFuncTime: " << afterCriticalHitSlowFuncTime << " num times: " << afterCriticalHitSlowNumTimes << "\n";
-			outFile << "takeDamageFuncTime: " << takeDamageFuncTime << " num times: " << takeDamageNumTimes << "\n";
-			outFile << "onTakeDamageFastFuncTime func time: " << onTakeDamageFastFuncTime << " num times: " << onTakeDamageFastNumTimes << "\n";
-			outFile << "onTakeDamageSlowFuncTime func time: " << onTakeDamageSlowFuncTime << " num times: " << onTakeDamageSlowNumTimes << "\n";
-			outFile << "applyOnHitEffectsFuncTime: " << applyOnHitEffectsFuncTime << " num times: " << applyOnHitEffectsNumTimes << "\n";
-			outFile << "applyOnHitEffectsSlowFuncTime: " << applyOnHitEffectsSlowFuncTime << " num times: " << applyOnHitEffectsSlowNumTimes << "\n";
-			outFile << "applyKnockbackFastFuncTime: " << applyKnockbackFastFuncTime << " num times: " << applyKnockbackFastNumTimes << "\n";
-			outFile << "applyKnockbackSlowFuncTime: " << applyKnockbackSlowFuncTime << " num times: " << applyKnockbackSlowNumTimes << "\n";
-			outFile << "applyStatusEffectsFastFuncTime: " << applyStatusEffectsFastFuncTime << " num times: " << applyStatusEffectsFastNumTimes << "\n";
-			outFile << "applyStatusEffectsSlowFuncTime: " << applyStatusEffectsSlowFuncTime << " num times: " << applyStatusEffectsSlowNumTimes << "\n";
-			outFile << "onTakeDamageAfterFastFuncTime: " << onTakeDamageAfterFastFuncTime << " num times: " << onTakeDamageAfterFastNumTimes << "\n";
-			outFile << "onTakeDamageAfterSlowFuncTime: " << onTakeDamageAfterSlowFuncTime << " num times: " << onTakeDamageAfterSlowNumTimes << "\n";
-			outFile << "onDodgeFastFuncTime: " << onDodgeFastFuncTime << " num times: " << onDodgeFastNumTimes << "\n";
-			outFile << "onDodgeSlowFuncTime: " << onDodgeSlowFuncTime << " num times: " << onDodgeSlowNumTimes << "\n";
-			outFile << "applyDamageFuncTime: " << applyDamageFuncTime << " num times: " << applyDamageNumTimes << "\n";
-			outFile << "hitNumberFuncTime: " << hitNumberFuncTime << " num times: " << hitNumberNumTimes << "\n";
-			outFile << "onKillingHitFuncTime: " << onKillingHitFuncTime << " num times: " << onKillingHitNumTimes << "\n";
-			outFile << "pushDamageDataFuncTime: " << pushDamageDataFuncTime << " num times: " << pushDamageDataNumTimes << "\n";
-			outFile << "soundPlayFuncTime: " << soundPlayFuncTime << " num times: " << soundPlayNumTimes << "\n";
-			outFile << "applyHitEffectFuncTime: " << applyHitEffectFuncTime << " num times: " << applyHitEffectNumTimes << "\n";
-			outFile << "dieFuncTime: " << dieFuncTime << " num times: " << dieNumTimes << "\n";
-			outFile << "dropEXPFuncTime: " << dropEXPFuncTime << " num times: " << dropEXPNumTimes << "\n";
-			outFile << "VariableStructExistsFastFuncTime: " << VariableStructExistsFastFuncTime << " num times: " << VariableStructExistsFastNumTimes << "\n";
-			outFile << "VariableStructExistsSlowFuncTime: " << VariableStructExistsSlowFuncTime << " num times: " << VariableStructExistsSlowNumTimes << "\n";
-		}
-		long long cumulativeTime = 0;
-		for (auto it = sortVec.begin(); it != sortVec.end(); it++)
-		{
-			if (it->first < 500 || cumulativeTime >= totTime - 2000)
+			sortVec.clear();
+			for (auto it = ProfilerMap.begin(); it != ProfilerMap.end(); it++)
 			{
-				break;
+				sortVec.push_back(std::make_pair(it->second, it->first));
 			}
-			cumulativeTime += it->first;
-			outFile << codeIndexToName[it->second] << " " << it->first << "\n";
-			//PrintMessage(CLR_DEFAULT, "%s %d", codeIndexToName[it->second], it->first);
+			std::sort(sortVec.begin(), sortVec.end(), std::greater<>());
+			outFile << "Frame Number: " << FrameNumber << " totTime: " << totTime << "\n";
+			if (timePtr != nullptr)
+			{
+				char buffer[100];
+				sprintf(buffer, "%d:%02d:%02d\n", static_cast<int>(timePtr->RefArray->m_Array[0].Real), static_cast<int>(timePtr->RefArray->m_Array[1].Real), static_cast<int>(timePtr->RefArray->m_Array[2].Real));
+				outFile << buffer;
+			}
+			if (behaviourFuncTime > 10)
+			{
+				outFile << "behaviourFuncTime: " << behaviourFuncTime << " num times: " << behaviourNumTimes << "\n";
+				outFile << "behaviourCollideWithPlayerFuncTime: " << behaviourCollideWithPlayerFuncTime << " num times: " << behaviourCollideWithPlayerNumTimes << "\n";
+				outFile << "behaviourFollowPlayerFuncTime: " << behaviourFollowPlayerFuncTime << " num times: " << behaviourFollowPlayerNumTimes << "\n";
+				outFile << "behaviourPowerScalingFuncTime: " << behaviourPowerScalingFuncTime << " num times: " << behaviourPowerScalingNumTimes << "\n";
+			}
+			if (executeAttackFuncTime > 1000)
+			{
+				outFile << "executeAttackFuncTime: " << executeAttackFuncTime << " num times: " << executeAttackNumTimes << "\n";
+			}
+			if (spawnMobFuncTime > 1000)
+			{
+				outFile << "spawnMobFuncTime: " << spawnMobFuncTime << " num times: " << spawnMobNumTimes << "\n";
+				outFile << "acutalSpawnMobFuncTime: " << acutalSpawnMobFuncTime << " num times: " << actualSpawnMobNumTimes << "\n";
+				outFile << "variableStructCopyFuncTime: " << variableStructCopyFuncTime << " num times: " << variableStructCopyNumTimes << "\n";
+			}
+			if (hitTargetFuncTime > 1000)
+			{
+				outFile << "hitTargetFuncTime: " << hitTargetFuncTime << " num times: " << hitTargetNumTimes << "\n";
+				outFile << "calculateDamageFuncTime: " << calculateDamageFuncTime << " num times: " << calculateDamageNumTimes << "\n";
+				outFile << "beforeDamageCalculationFastFuncTime: " << beforeDamageCalculationFastFuncTime << " num times: " << beforeDamageCalculationFastNumTimes << "\n";
+				outFile << "beforeDamageCalculationSlowFuncTime: " << beforeDamageCalculationSlowFuncTime << " num times: " << beforeDamageCalculationSlowNumTimes << "\n";
+				outFile << "onCriticalHitFastFuncTime: " << onCriticalHitFastFuncTime << " num times: " << onCriticalHitFastNumTimes << "\n";
+				outFile << "onCriticalHitSlowFuncTime: " << onCriticalHitSlowFuncTime << " num times: " << onCriticalHitSlowNumTimes << "\n";
+				outFile << "afterCriticalHitFastFuncTime: " << afterCriticalHitFastFuncTime << " num times: " << afterCriticalHitFastNumTimes << "\n";
+				outFile << "afterCriticalHitSlowFuncTime: " << afterCriticalHitSlowFuncTime << " num times: " << afterCriticalHitSlowNumTimes << "\n";
+				outFile << "takeDamageFuncTime: " << takeDamageFuncTime << " num times: " << takeDamageNumTimes << "\n";
+				outFile << "onTakeDamageFastFuncTime func time: " << onTakeDamageFastFuncTime << " num times: " << onTakeDamageFastNumTimes << "\n";
+				outFile << "onTakeDamageSlowFuncTime func time: " << onTakeDamageSlowFuncTime << " num times: " << onTakeDamageSlowNumTimes << "\n";
+				outFile << "applyOnHitEffectsFuncTime: " << applyOnHitEffectsFuncTime << " num times: " << applyOnHitEffectsNumTimes << "\n";
+				outFile << "applyOnHitEffectsSlowFuncTime: " << applyOnHitEffectsSlowFuncTime << " num times: " << applyOnHitEffectsSlowNumTimes << "\n";
+				outFile << "applyKnockbackFastFuncTime: " << applyKnockbackFastFuncTime << " num times: " << applyKnockbackFastNumTimes << "\n";
+				outFile << "applyKnockbackSlowFuncTime: " << applyKnockbackSlowFuncTime << " num times: " << applyKnockbackSlowNumTimes << "\n";
+				outFile << "applyStatusEffectsFastFuncTime: " << applyStatusEffectsFastFuncTime << " num times: " << applyStatusEffectsFastNumTimes << "\n";
+				outFile << "applyStatusEffectsSlowFuncTime: " << applyStatusEffectsSlowFuncTime << " num times: " << applyStatusEffectsSlowNumTimes << "\n";
+				outFile << "onTakeDamageAfterFastFuncTime: " << onTakeDamageAfterFastFuncTime << " num times: " << onTakeDamageAfterFastNumTimes << "\n";
+				outFile << "onTakeDamageAfterSlowFuncTime: " << onTakeDamageAfterSlowFuncTime << " num times: " << onTakeDamageAfterSlowNumTimes << "\n";
+				outFile << "onDodgeFastFuncTime: " << onDodgeFastFuncTime << " num times: " << onDodgeFastNumTimes << "\n";
+				outFile << "onDodgeSlowFuncTime: " << onDodgeSlowFuncTime << " num times: " << onDodgeSlowNumTimes << "\n";
+				outFile << "applyDamageFuncTime: " << applyDamageFuncTime << " num times: " << applyDamageNumTimes << "\n";
+				outFile << "hitNumberFuncTime: " << hitNumberFuncTime << " num times: " << hitNumberNumTimes << "\n";
+				outFile << "onKillingHitFuncTime: " << onKillingHitFuncTime << " num times: " << onKillingHitNumTimes << "\n";
+				outFile << "pushDamageDataFuncTime: " << pushDamageDataFuncTime << " num times: " << pushDamageDataNumTimes << "\n";
+				outFile << "soundPlayFuncTime: " << soundPlayFuncTime << " num times: " << soundPlayNumTimes << "\n";
+				outFile << "applyHitEffectFuncTime: " << applyHitEffectFuncTime << " num times: " << applyHitEffectNumTimes << "\n";
+				outFile << "dieFuncTime: " << dieFuncTime << " num times: " << dieNumTimes << "\n";
+				outFile << "dropEXPFuncTime: " << dropEXPFuncTime << " num times: " << dropEXPNumTimes << "\n";
+				outFile << "VariableStructExistsFastFuncTime: " << VariableStructExistsFastFuncTime << " num times: " << VariableStructExistsFastNumTimes << "\n";
+				outFile << "VariableStructExistsSlowFuncTime: " << VariableStructExistsSlowFuncTime << " num times: " << VariableStructExistsSlowNumTimes << "\n";
+			}
+			long long cumulativeTime = 0;
+			for (auto it = sortVec.begin(); it != sortVec.end(); it++)
+			{
+				if (it->first < 500 || cumulativeTime >= totTime - 2000)
+				{
+					break;
+				}
+				cumulativeTime += it->first;
+				outFile << codeIndexToName[it->second] << " " << it->first << "\n";
+				//PrintMessage(CLR_DEFAULT, "%s %d", codeIndexToName[it->second], it->first);
+			}
 		}
+		for (auto& it : funcParams)
+		{
+			YYRValue ret;
+			PrintMessage(CLR_DEFAULT, "%d %d %d %d %d", it.Self, it.Other, it.ReturnValue, it.numArgs, it.Args);
+			//		origTestFunc(it.Self, it.Other, &ret, 1, it.Args);
+		}
+		onTakeDamageFastNumTimes = 0;
+		onTakeDamageFastFuncTime = 0;
+		onTakeDamageSlowNumTimes = 0;
+		onTakeDamageSlowFuncTime = 0;
+		applyOnHitEffectsFuncTime = 0;
+		applyOnHitEffectsNumTimes = 0;
+		applyKnockbackFastFuncTime = 0;
+		applyKnockbackFastNumTimes = 0;
+		applyKnockbackSlowFuncTime = 0;
+		applyKnockbackSlowNumTimes = 0;
+		applyStatusEffectsFastFuncTime = 0;
+		applyStatusEffectsFastNumTimes = 0;
+		applyStatusEffectsSlowFuncTime = 0;
+		applyStatusEffectsSlowNumTimes = 0;
+		onTakeDamageAfterFastFuncTime = 0;
+		onTakeDamageAfterFastNumTimes = 0;
+		onTakeDamageAfterSlowFuncTime = 0;
+		onTakeDamageAfterSlowNumTimes = 0;
+		onDodgeFastFuncTime = 0;
+		onDodgeFastNumTimes = 0;
+		onDodgeSlowFuncTime = 0;
+		onDodgeSlowNumTimes = 0;
+		applyDamageFuncTime = 0;
+		applyDamageNumTimes = 0;
+		hitNumberFuncTime = 0;
+		hitNumberNumTimes = 0;
+		onKillingHitFuncTime = 0;
+		onKillingHitNumTimes = 0;
+		pushDamageDataFuncTime = 0;
+		pushDamageDataNumTimes = 0;
+		soundPlayFuncTime = 0;
+		soundPlayNumTimes = 0;
+		applyHitEffectFuncTime = 0;
+		applyHitEffectNumTimes = 0;
+		dieFuncTime = 0;
+		dieNumTimes = 0;
+		takeDamageFuncTime = 0;
+		takeDamageNumTimes = 0;
+		calculateDamageFuncTime = 0;
+		calculateDamageNumTimes = 0;
+		hitTargetFuncTime = 0;
+		hitTargetNumTimes = 0;
+		onCriticalHitFastFuncTime = 0;
+		onCriticalHitFastNumTimes = 0;
+		onCriticalHitSlowFuncTime = 0;
+		onCriticalHitSlowNumTimes = 0;
+		afterCriticalHitFastFuncTime = 0;
+		afterCriticalHitFastNumTimes = 0;
+		afterCriticalHitSlowFuncTime = 0;
+		afterCriticalHitSlowNumTimes = 0;
+		dropEXPFuncTime = 0;
+		dropEXPNumTimes = 0;
+		beforeDamageCalculationFastFuncTime = 0;
+		beforeDamageCalculationFastNumTimes = 0;
+		beforeDamageCalculationSlowFuncTime = 0;
+		beforeDamageCalculationSlowNumTimes = 0;
+		applyOnHitEffectsSlowFuncTime = 0;
+		applyOnHitEffectsSlowNumTimes = 0;
+		VariableStructExistsFastFuncTime = 0;
+		VariableStructExistsFastNumTimes = 0;
+		VariableStructExistsSlowFuncTime = 0;
+		VariableStructExistsSlowNumTimes = 0;
+		spawnMobFuncTime = 0;
+		spawnMobNumTimes = 0;
+		acutalSpawnMobFuncTime = 0;
+		actualSpawnMobNumTimes = 0;
+		variableStructCopyFuncTime = 0;
+		variableStructCopyNumTimes = 0;
+		executeAttackFuncTime = 0;
+		executeAttackNumTimes = 0;
+		behaviourFuncTime = 0;
+		behaviourNumTimes = 0;
+		behaviourCollideWithPlayerFuncTime = 0;
+		behaviourCollideWithPlayerNumTimes = 0;
+		behaviourFollowPlayerFuncTime = 0;
+		behaviourFollowPlayerNumTimes = 0;
+		behaviourPowerScalingFuncTime = 0;
+		behaviourPowerScalingNumTimes = 0;
+		totTime = 0;
+		ProfilerMap.clear();
+		funcParams.clear();
 	}
-	for (auto& it : funcParams)
-	{
-		YYRValue ret;
-		PrintMessage(CLR_DEFAULT, "%d %d %d %d %d", it.Self, it.Other, it.ReturnValue, it.numArgs, it.Args);
-		//		origTestFunc(it.Self, it.Other, &ret, 1, it.Args);
-	}
-	onTakeDamageFastNumTimes = 0;
-	onTakeDamageFastFuncTime = 0;
-	onTakeDamageSlowNumTimes = 0;
-	onTakeDamageSlowFuncTime = 0;
-	applyOnHitEffectsFuncTime = 0;
-	applyOnHitEffectsNumTimes = 0;
-	applyKnockbackFastFuncTime = 0;
-	applyKnockbackFastNumTimes = 0;
-	applyKnockbackSlowFuncTime = 0;
-	applyKnockbackSlowNumTimes = 0;
-	applyStatusEffectsFastFuncTime = 0;
-	applyStatusEffectsFastNumTimes = 0;
-	applyStatusEffectsSlowFuncTime = 0;
-	applyStatusEffectsSlowNumTimes = 0;
-	onTakeDamageAfterFastFuncTime = 0;
-	onTakeDamageAfterFastNumTimes = 0;
-	onTakeDamageAfterSlowFuncTime = 0;
-	onTakeDamageAfterSlowNumTimes = 0;
-	onDodgeFastFuncTime = 0;
-	onDodgeFastNumTimes = 0;
-	onDodgeSlowFuncTime = 0;
-	onDodgeSlowNumTimes = 0;
-	applyDamageFuncTime = 0;
-	applyDamageNumTimes = 0;
-	hitNumberFuncTime = 0;
-	hitNumberNumTimes = 0;
-	onKillingHitFuncTime = 0;
-	onKillingHitNumTimes = 0;
-	pushDamageDataFuncTime = 0;
-	pushDamageDataNumTimes = 0;
-	soundPlayFuncTime = 0;
-	soundPlayNumTimes = 0;
-	applyHitEffectFuncTime = 0;
-	applyHitEffectNumTimes = 0;
-	dieFuncTime = 0;
-	dieNumTimes = 0;
-	takeDamageFuncTime = 0;
-	takeDamageNumTimes = 0;
-	calculateDamageFuncTime = 0;
-	calculateDamageNumTimes = 0;
-	hitTargetFuncTime = 0;
-	hitTargetNumTimes = 0;
-	onCriticalHitFastFuncTime = 0;
-	onCriticalHitFastNumTimes = 0;
-	onCriticalHitSlowFuncTime = 0;
-	onCriticalHitSlowNumTimes = 0;
-	afterCriticalHitFastFuncTime = 0;
-	afterCriticalHitFastNumTimes = 0;
-	afterCriticalHitSlowFuncTime = 0;
-	afterCriticalHitSlowNumTimes = 0;
-	dropEXPFuncTime = 0;
-	dropEXPNumTimes = 0;
-	beforeDamageCalculationFastFuncTime = 0;
-	beforeDamageCalculationFastNumTimes = 0;
-	beforeDamageCalculationSlowFuncTime = 0;
-	beforeDamageCalculationSlowNumTimes = 0;
-	applyOnHitEffectsSlowFuncTime = 0;
-	applyOnHitEffectsSlowNumTimes = 0;
-	VariableStructExistsFastFuncTime = 0;
-	VariableStructExistsFastNumTimes = 0;
-	VariableStructExistsSlowFuncTime = 0;
-	VariableStructExistsSlowNumTimes = 0;
-	spawnMobFuncTime = 0;
-	spawnMobNumTimes = 0;
-	acutalSpawnMobFuncTime = 0;
-	actualSpawnMobNumTimes = 0;
-	variableStructCopyFuncTime = 0;
-	variableStructCopyNumTimes = 0;
-	totTime = 0;
-	ProfilerMap.clear();
-	funcParams.clear();
 
 	// Tell the core the handler was successful.
 	return YYTK_OK;
 }
 
 // This callback is registered on EVT_CODE_EXECUTE, so it gets called every game function call.
-YYTKStatus CodeCallback(YYTKEventBase* pEvent, void* OptionalArgument)
+YYTKStatus CodeCallback(YYTKCodeEvent* pCodeEvent, void* OptionalArgument)
 {
-
-	YYTKCodeEvent* pCodeEvent = dynamic_cast<decltype(pCodeEvent)>(pEvent);
-
 	std::tuple<CInstance*, CInstance*, CCode*, RValue*, int> args = pCodeEvent->Arguments();
 
 	CInstance*	Self	= std::get<0>(args);
@@ -1905,21 +2144,20 @@ YYTKStatus CodeCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 		PrintMessage(CLR_DEFAULT, "%s", Code->i_pName);
 	}
 	*/
-
-	if (codeFuncTable.count(Code->i_CodeIndex) != 0)
+	auto codeFunc = codeFuncTable.find(Code->i_CodeIndex);
+	if (codeFunc != codeFuncTable.end())
 	{
-		if (codeFuncTable[Code->i_CodeIndex] != nullptr)
+		long long startTime = StartProfilerTime();
+		codeFunc->second(pCodeEvent, Self, Other, Code, Res, Flags);
+		long long curTime = 0;
+		int numTimes = 0;
+		EndProfilerTime(startTime, MICROSECONDS, curTime, numTimes);
+		if (ProfilerMap.count(Code->i_CodeIndex) == 0)
 		{
-			auto start = std::chrono::high_resolution_clock::now();
-			codeFuncTable[Code->i_CodeIndex](pCodeEvent, Self, Other, Code, Res, Flags);
-			auto end = std::chrono::high_resolution_clock::now();
-			if (ProfilerMap.count(Code->i_CodeIndex) == 0)
-			{
-				ProfilerMap[Code->i_CodeIndex] = 0;
-			}
-			totTime += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-			ProfilerMap[Code->i_CodeIndex] += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+			ProfilerMap[Code->i_CodeIndex] = 0;
 		}
+		totTime += curTime;
+		ProfilerMap[Code->i_CodeIndex] += curTime;
 	}
 	else // Haven't cached the function in the table yet. Run the if statements and assign the function to the code index
 	{
@@ -1992,220 +2230,6 @@ YYTKStatus CodeCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 			Player_Step_0(pCodeEvent, Self, Other, Code, Res, Flags);
 			codeFuncTable[Code->i_CodeIndex] = Player_Step_0;
 		}
-		else if (_strcmpi(Code->i_pName, "gml_Object_obj_MobManager_Other_12") == 0)
-		{
-			behaviourFuncTable.clear();
-			auto MobManager_Other_12 = [](YYTKCodeEvent* pCodeEvent, CInstance* Self, CInstance* Other, CCode* Code, RValue* Res, int Flags) {
-				pCodeEvent->Call(Self, Other, Code, Res, Flags);
-				YYRValue Result;
-				CallBuiltin(Result, "variable_instance_get", Self, Other, { (long long)Self->i_id, "behaviours" });
-				YYRValue ResultOne;
-				YYRValue ResultTwo;
-				CallBuiltin(ResultOne, "struct_get", Self, Other, { Result, "collideWithPlayer" });
-				CallBuiltin(ResultTwo, "struct_get", Self, Other, { ResultOne, "Script" });
-				auto collideWithPlayerFunc = [](CInstance* Self) {
-				};
-				behaviourFuncTable[(int)(void*)ResultTwo.Object] = collideWithPlayerFunc;
-				CallBuiltin(ResultOne, "struct_get", Self, Other, { Result, "followPlayer" });
-				CallBuiltin(ResultTwo, "struct_get", Self, Other, { ResultOne, "Script" });
-				auto followPlayerFunc = [](CInstance* Self) {
-					if (currentPlayer.gmlInstance.xPos > Self->i_x)
-					{
-						Self->i_imagescalex = abs(Self->i_imagescalex);
-					}
-					else
-					{
-						Self->i_imagescalex = -abs(Self->i_imagescalex);
-					}
-					RValue* SPDRef = nullptr;
-					Self->m_yyvarsMap->FindElement(enemyVarIndexMap[14], SPDRef);
-					RValue* directionMovingRef = nullptr;
-					Self->m_yyvarsMap->FindElement(enemyVarIndexMap[15], directionMovingRef);
-					RValue* directionChangeTimeRef = nullptr;
-					Self->m_yyvarsMap->FindElement(enemyVarIndexMap[8], directionChangeTimeRef);
-					double curDirectionAngle = directionMovingRef->Real;
-					if (directionChangeTimeRef->Real == 0)
-					{
-						curDirectionAngle = 180.0 / M_PI * atan2(currentPlayer.gmlInstance.yPos - Self->i_y, currentPlayer.gmlInstance.xPos - Self->i_x);
-						if (curDirectionAngle < 0)
-						{
-							curDirectionAngle += 360;
-						}
-						directionChangeTimeRef->Real = 3;
-						directionMovingRef->Real = curDirectionAngle;
-					}
-					if (curDirectionAngle >= 180)
-					{
-						curDirectionAngle -= 360;
-					}
-					double speed = SPDRef->Real;
-					Self->i_x += cos(curDirectionAngle * M_PI / 180.0) * speed;
-					Self->i_y += sin(curDirectionAngle * M_PI / 180.0) * speed;
-				};
-				behaviourFuncTable[(int)(void*)ResultTwo.Object] = followPlayerFunc;
-				CallBuiltin(ResultOne, "struct_get", Self, Other, { Result, "powerScaling" });
-				CallBuiltin(ResultTwo, "struct_get", Self, Other, { ResultOne, "Script" });
-				auto powerScalingFunc = [](CInstance* Self) {
-				};
-				behaviourFuncTable[(int)(void*)ResultTwo.Object] = powerScalingFunc;
-			};
-			MobManager_Other_12(pCodeEvent, Self, Other, Code, Res, Flags);
-			codeFuncTable[Code->i_CodeIndex] = MobManager_Other_12;
-		}
-		else if (_strcmpi(Code->i_pName, "gml_Object_obj_Enemy_Step_0") == 0)
-		{
-			auto Enemy_Step_0 = [](YYTKCodeEvent* pCodeEvent, CInstance* Self, CInstance* Other, CCode* Code, RValue* Res, int Flags) {
-				RValue* collidedCDRef = nullptr;
-				Self->m_yyvarsMap->FindElement(enemyVarIndexMap[0], collidedCDRef);
-				RValue* lifeTimeRef = nullptr;
-				Self->m_yyvarsMap->FindElement(enemyVarIndexMap[1], lifeTimeRef);
-				if (collidedCDRef->Real > 0.5 && lifeTimeRef->Real > 1.5)
-				{
-					RValue* behaviourStructRef = nullptr;
-					Self->m_yyvarsMap->FindElement(enemyVarIndexMap[2], behaviourStructRef);
-					if (behaviourStructRef->Object->m_yyvarsMap)
-					{
-						std::vector<int> funcAddressList;
-						bool hasAllScripts = true;
-
-						for (int i = 0; i < behaviourStructRef->Object->m_yyvarsMap->m_curSize; i++)
-						{
-							if (behaviourStructRef->Object->m_yyvarsMap->m_pBuckets[i].Hash != 0)
-							{
-								RValue* enemyBehaviour = behaviourStructRef->Object->m_yyvarsMap->m_pBuckets[i].v;
-								//find the bucket that contains the script function reference
-								if (enemyBehaviourScriptBucket == -1)
-								{
-									int maxID = -1;
-									int pos = -1;
-									for (int j = 0; j < enemyBehaviour->Object->m_yyvarsMap->m_curSize; j++)
-									{
-										if (enemyBehaviour->Object->m_yyvarsMap->m_pBuckets[j].Hash != 0 && enemyBehaviour->Object->m_yyvarsMap->m_pBuckets[j].k > maxID)
-										{
-											maxID = enemyBehaviour->Object->m_yyvarsMap->m_pBuckets[j].k;
-											pos = j;
-										}
-									}
-									enemyBehaviourScriptBucket = pos;
-								}
-								RValue* behaviourScript = enemyBehaviour->Object->m_yyvarsMap->m_pBuckets[enemyBehaviourScriptBucket].v;
-
-								if (behaviourFuncTable.count((int)(void*)(behaviourScript->Object)) == 0)
-								{
-									hasAllScripts = false;
-									break;
-								}
-								funcAddressList.push_back((int)(void*)(behaviourScript->Object));
-							}
-						}
-
-						if (hasAllScripts)
-						{
-							YYRValue Result;
-							RValue* isDeadRef = nullptr;
-							Self->m_yyvarsMap->FindElement(enemyVarIndexMap[3], isDeadRef);
-							RValue* tangibleRef = nullptr;
-							Self->m_yyvarsMap->FindElement(enemyVarIndexMap[4], tangibleRef);
-							RValue* moveOutsideCDRef = nullptr;
-							Self->m_yyvarsMap->FindElement(enemyVarIndexMap[5], moveOutsideCDRef);
-							RValue* isKnockbackRef = nullptr;
-							Self->m_yyvarsMap->FindElement(enemyVarIndexMap[6], isKnockbackRef);
-							RValue* completeStopRef = nullptr;
-							Self->m_yyvarsMap->FindElement(enemyVarIndexMap[7], completeStopRef);
-							if (moveOutsideCDRef->Real >= 0.5)
-							{
-								moveOutsideCDRef->Real--;
-							}
-							if (completeStopRef->Real < 0.5)
-							{
-								//TODO: Implement speed check
-
-								RValue* directionChangeTimeRef = nullptr;
-								Self->m_yyvarsMap->FindElement(enemyVarIndexMap[8], directionChangeTimeRef);
-								if (directionChangeTimeRef->Real > 0.5)
-								{
-									directionChangeTimeRef->Real--;
-								}
-								if (collidedCDRef->Real > 0.5)
-								{
-									collidedCDRef->Real--;
-								}
-								RValue* lockFacingRef = nullptr;
-								Self->m_yyvarsMap->FindElement(enemyVarIndexMap[9], lockFacingRef);
-								RValue* turnTimerRef = nullptr;
-								Self->m_yyvarsMap->FindElement(enemyVarIndexMap[10], turnTimerRef);
-								RValue* canMoveRef = nullptr;
-								Self->m_yyvarsMap->FindElement(enemyVarIndexMap[11], canMoveRef);
-								if (lockFacingRef->Real > 0.5 && turnTimerRef->Real < 0.5 && canMoveRef->Real > 0.5)
-								{
-									if (currentPlayer.gmlInstance.xPos > Self->i_x)
-									{
-										Self->i_imagescalex = abs(Self->i_imagescalex);
-									}
-									else
-									{
-										Self->i_imagescalex = -abs(Self->i_imagescalex);
-									}
-									turnTimerRef->Real = 15;
-								}
-								if (turnTimerRef->Real > 0.5)
-								{
-									turnTimerRef->Real--;
-								}
-
-								//TODO: add check for knockback timer
-								//
-								{
-									for (int funcAddress : funcAddressList)
-									{
-										behaviourFuncTable[funcAddress](Self);
-									}
-								}
-								RValue* hitCDTimerRef = nullptr;
-								Self->m_yyvarsMap->FindElement(enemyVarIndexMap[12], hitCDTimerRef);
-								if (hitCDTimerRef->Real > 0.5)
-								{
-									hitCDTimerRef->Real--;
-								}
-								RValue* aliveForRef = nullptr;
-								Self->m_yyvarsMap->FindElement(enemyVarIndexMap[13], aliveForRef);
-								aliveForRef->Real++;
-							}
-							numEnemyStepSkip++;
-							pCodeEvent->Cancel(true);
-						}
-						else
-						{
-							numEnemyStepCall++;
-							pCodeEvent->Call(Self, Other, Code, Res, Flags);
-						}
-
-					}
-				}
-				else
-				{
-					numEnemyStepCall++;
-					pCodeEvent->Call(Self, Other, Code, Res, Flags);
-				}
-			};
-			Enemy_Step_0(pCodeEvent, Self, Other, Code, Res, Flags);
-			codeFuncTable[Code->i_CodeIndex] = Enemy_Step_0;
-		}
-		else if (_strcmpi(Code->i_pName, "gml_Object_obj_Enemy_Draw_0") == 0)
-		{
-			auto Enemy_Draw_0 = [pCodeEvent](YYTKCodeEvent* pCodeEvent, CInstance* Self, CInstance* Other, CCode* Code, RValue* Res, int Flags) {
-				if (Self->i_x < CameraXPos - 32 || Self->i_x > CameraXPos + 640 + 32 || Self->i_y < CameraYPos - 32 || Self->i_y > CameraYPos + 640 + 32)
-				{
-					pCodeEvent->Cancel(true);
-				}
-				else
-				{
-					pCodeEvent->Call(Self, Other, Code, Res, Flags);
-				}
-			};
-			Enemy_Draw_0(pCodeEvent, Self, Other, Code, Res, Flags);
-			codeFuncTable[Code->i_CodeIndex] = Enemy_Draw_0;
-		}
 		else if (_strcmpi(Code->i_pName, "gml_Object_obj_EXP_Step_0") == 0)
 		{
 			auto EXP_Step_0 = [](YYTKCodeEvent* pCodeEvent, CInstance* Self, CInstance* Other, CCode* Code, RValue* Res, int Flags) {
@@ -2271,6 +2295,14 @@ YYTKStatus CodeCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 			PlayerManager_Alarm_11(pCodeEvent, Self, Other, Code, Res, Flags);
 			codeFuncTable[Code->i_CodeIndex] = PlayerManager_Alarm_11;
 		}
+		else if (_strcmpi(Code->i_pName, "gml_Object_obj_PlayerManager_Step_0") == 0)
+		{
+			auto PlayerManager_Step_0 = [](YYTKCodeEvent* pCodeEvent, CInstance* Self, CInstance* Other, CCode* Code, RValue* Res, int Flags) {
+				pCodeEvent->Call(Self, Other, Code, Res, Flags);
+			};
+			PlayerManager_Step_0(pCodeEvent, Self, Other, Code, Res, Flags);
+			codeFuncTable[Code->i_CodeIndex] = PlayerManager_Step_0;
+		}
 		else if (_strcmpi(Code->i_pName, "gml_Object_obj_EXPAbsorb_Collision_obj_Player") == 0)
 		{
 			auto EXPAbsorb_Collision_obj_Player = [](YYTKCodeEvent* pCodeEvent, CInstance* Self, CInstance* Other, CCode* Code, RValue* Res, int Flags) {
@@ -2321,12 +2353,9 @@ YYTKStatus CodeCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 			auto Attack_Create_0 = [](YYTKCodeEvent* pCodeEvent, CInstance* Self, CInstance* Other, CCode* Code, RValue* Res, int Flags) {
 				attackHitEnemyFrameNumberMap[Self->i_id] = std::unordered_map<int, uint32_t>();
 				pCodeEvent->Call(Self, Other, Code, Res, Flags);
-				if (attackHitCooldownMap.count(Self->i_spriteindex) == 0)
-				{
-					YYRValue Result;
-					CallBuiltin(Result, "variable_instance_get", Self, Other, { (long long)Self->i_id, "hitCD" });
-					attackHitCooldownMap[Self->i_spriteindex] = static_cast<int>(Result);
-				}
+				RValue* hitCDPtr = nullptr;
+				Self->m_yyvarsMap->FindElement(GMLVarIndexMapYYTKHash[GML_hitCD], hitCDPtr);
+				attackHitCooldownMap[Self->i_spriteindex] = static_cast<int>(hitCDPtr->Real);
 			};
 			Attack_Create_0(pCodeEvent, Self, Other, Code, Res, Flags);
 			codeFuncTable[Code->i_CodeIndex] = Attack_Create_0;
@@ -2362,7 +2391,7 @@ YYTKStatus CodeCallback(YYTKEventBase* pEvent, void* OptionalArgument)
 			auto damageText_Alarm_0 = [](YYTKCodeEvent* pCodeEvent, CInstance* Self, CInstance* Other, CCode* Code, RValue* Res, int Flags) {
 				pCodeEvent->Call(Self, Other, Code, Res, Flags);
 				RValue* durationPtr = nullptr;
-				int durationHash = attackIndexMap[10];
+				int durationHash = GMLVarIndexMapYYTKHash[GML_duration];
 				Self->m_yyvarsMap->FindElement(durationHash, durationPtr);
 				if (durationPtr->Real <= -2)
 				{
@@ -2424,7 +2453,7 @@ DllExport YYTKStatus PluginEntry(YYTKPlugin* PluginObject)
 	Status = PmCreateCallback(
 		PluginAttributes,					// Plugin Attributes
 		g_pCodeCallbackAttributes,			// (out) Callback Attributes
-		CodeCallback,						// The function to register as a callback
+		reinterpret_cast<FNEventHandler>(CodeCallback),	// The function to register as a callback
 		static_cast<EventType>(EVT_CODE_EXECUTE), // Which events trigger this callback
 		nullptr								// The optional argument to pass to the function
 	);
@@ -2473,6 +2502,7 @@ DllExport YYTKStatus PluginEntry(YYTKPlugin* PluginObject)
 	HookScriptFunction("gml_Script_glr_light_set_active",										(void*)&GLRLightSetActiveFuncDetour,		(void**)&origGLRLightSetActiveScript);
 	HookScriptFunction("gml_Script_glr_mesh_destroy",											(void*)&GLRMeshDestroyFuncDetour,			(void**)&origGLRMeshDestroyScript);
 	HookScriptFunction("gml_Script_CanSubmitScore_gml_Object_obj_PlayerManager_Create_0",		(void*)&CanSubmitScoreFuncDetour,			(void**)&origCanSubmitScoreScript);
+	HookScriptFunction("gml_Script_ExecuteAttack_gml_Object_obj_AttackController_Create_0",		(void*)&ExecuteAttackFuncDetour,			(void**)&origExecuteAttackScript);
 	
 	GetFunctionByName("method_call", scriptExecuteFunc);
 
@@ -2580,84 +2610,28 @@ DllExport YYTKStatus PluginEntry(YYTKPlugin* PluginObject)
 	GetFunctionByName("array_create", arrayCreateFunc);
 	GetFunctionByName("ds_list_find_value", DSListFindValueFunc);
 
-	std::vector<const char*> varNames;
-	varNames.push_back("collidedCD");
-	varNames.push_back("lifeTime");
-	varNames.push_back("behaviours");
-	varNames.push_back("isDead");
-	varNames.push_back("tangible");
-	varNames.push_back("moveOutsideCD");
-	varNames.push_back("isKnockback");
-	varNames.push_back("completeStop");
-	varNames.push_back("directionChangeTime");
-	varNames.push_back("lockFacing");
-	varNames.push_back("turnTimer");
-	varNames.push_back("canMove");
-	varNames.push_back("hitCDTimer");
-	varNames.push_back("aliveFor");
-	varNames.push_back("SPD");
-	varNames.push_back("directionMoving");
-	varNames.push_back("Shrimp");
-	for (int i = 0; i < varNames.size(); i++)
+	for (int i = 0; i < std::extent<decltype(VariableNamesStringsArr)>::value; i++)
 	{
 		RValue Res;
 		RValue arg{};
 		arg.Kind = VALUE_STRING;
-		arg.String = RefString::Alloc(varNames[i], strlen(varNames[i]));
+		arg.String = RefString::Alloc(VariableNamesStringsArr[i], strlen(VariableNamesStringsArr[i]));
 		variableGetHashFunc(&Res, nullptr, nullptr, 1, &arg);
-		enemyVarIndexMap[i] = CHashMap<int, RValue>::CalculateHash(static_cast<int>(Res.Real)) % (1ll << 31);
-	}
-	varNames.clear();
-
-	varNames.push_back("beforeDamageCalculation");
-	varNames.push_back("afterCriticalHit");
-	varNames.push_back("onCriticalHit");
-	varNames.push_back("onTakeDamage");
-	varNames.push_back("onTakeDamageAfter");
-	varNames.push_back("onDodge");
-	varNames.push_back("invincible");
-	varNames.push_back("sprite_index");
-	varNames.push_back("GLR_MESH_DYN_LIST");
-	for (int i = 0; i < varNames.size(); i++)
-	{
-		RValue Res;
-		RValue arg{};
-		arg.Kind = VALUE_STRING;
-		arg.String = RefString::Alloc(varNames[i], strlen(varNames[i]));
-		variableGetHashFunc(&Res, nullptr, nullptr, 1, &arg);
-		baseMobVarIndexMap[i] = CHashMap<int, RValue>::CalculateHash(static_cast<int>(Res.Real)) % (1ll << 31);
-	}
-	CallBuiltin(Result, "variable_get_hash", nullptr, nullptr, { "debuffDisplay" });
-	baseMobVarIndexMap[1000] = CHashMap<int, RValue>::CalculateHash(static_cast<int>(Result.Real)) % (1ll << 31);
-	varNames.clear();
-
-	varNames.push_back("isEnemy");
-	varNames.push_back("creator");
-	varNames.push_back("OnHitEffects");
-	varNames.push_back("onHitEffects");
-	varNames.push_back("statusEffects");
-	varNames.push_back("knockback");
-	varNames.push_back("duration");
-	varNames.push_back("isKnockback");
-	varNames.push_back("knockbackImmune");
-	varNames.push_back("showDamageText");
-	varNames.push_back("duration");
-	for (int i = 0; i < varNames.size(); i++)
-	{
-		RValue Res;
-		RValue arg{};
-		arg.Kind = VALUE_STRING;
-		arg.String = RefString::Alloc(varNames[i], strlen(varNames[i]));
-		variableGetHashFunc(&Res, nullptr, nullptr, 1, &arg);
-		attackIndexMap[i] = CHashMap<int, RValue>::CalculateHash(static_cast<int>(Res.Real)) % (1ll << 31);
+		GMLVarIndexMapGMLHash[i] = static_cast<int>(Res.Real);
+		GMLVarIndexMapYYTKHash[i] = CHashMap<int, RValue>::CalculateHash(static_cast<int>(Res.Real)) % (1ll << 31);
 	}
 
 	objDamageTextIndex = getAssetIndexFromName("obj_damageText");
 	objEnemyIndex = getAssetIndexFromName("obj_Enemy");
+	objPreCreateIndex = getAssetIndexFromName("obj_PreCreate");
+	objAttackIndex = getAssetIndexFromName("obj_Attack");
 
-	CallBuiltin(Result, "show_debug_overlay", nullptr, nullptr, { true });
+	if (ENABLEPROFILER)
+	{
+		CallBuiltin(Result, "show_debug_overlay", nullptr, nullptr, { true });
+		outFile.open("test.txt");
+	}
 
-	outFile.open("test.txt");
 	// Off it goes to the core.
 	return YYTK_OK;
 }

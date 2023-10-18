@@ -9,3 +9,6 @@ A Holocure mod that improves the performance of various parts of the game (Enemy
     - Click `Select` for the Runner and select the `HoloCure.exe` in the new folder
     - Click `Open plugin folder` and put `Optimization.dll` in the autoexec folder
     - Click `Start process` to start the game
+## Additional Information
+- If you want to play with controller, add the YYToolkit launcher `Launcher.exe` to Steam and launch it through Steam.
+- There may be some issues when launching the game with fullscreen enabled. Try launching it without fullscreen and then enabling it after.

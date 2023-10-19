@@ -3,6 +3,7 @@ A Holocure mod that improves the performance of various parts of the game (Enemy
 ## Installation Steps
 - Download `Optimization.dll` from the latest version of the mod https://github.com/PippleCultist/Holocure-Optimization-Mod/releases
 - Download `Launcher.exe` from the latest version of YYToolkit https://github.com/Archie-osu/YYToolkit/releases
+    - Note: This launcher may be marked as a Trojan by your antivirus. YYToolkit is opensource and has been used in several modding communities without issues.
 - Copy over the folder containing `HoloCure.exe` to a separate location and delete `steam_api64.dll` and `Steamworks_x64.dll` from the new folder
     - You can find this file through steam by clicking `Browse local files`
 - Run `Launcher.exe`

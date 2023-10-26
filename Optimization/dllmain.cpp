@@ -1585,7 +1585,7 @@ void VariableInstanceGetNamesDetour(RValue* Result, CInstance* Self, CInstance* 
 		Result->Kind = VALUE_UNSET;
 		return;
 	}
-	if (isInSpawnMobFunc || isInActualSpawnMobFunc)
+	if (isInSpawnMobFunc || (isInActualSpawnMobFunc && !isInExecuteAttack))
 	{
 		int spriteIndexHash = GMLVarIndexMapYYTKHash[GML_sprite_index];
 		RValue* spriteIndexPtr = nullptr;
